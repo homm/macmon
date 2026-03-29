@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use std::{io::stdout, time::Instant};
 use std::{sync::mpsc, time::Duration};
@@ -10,8 +11,8 @@ use ratatui::crossterm::{
 use ratatui::{prelude::*, widgets::*};
 
 use crate::config::{Config, ViewType};
-use crate::metrics::{Metrics, Sampler, zero_div};
-use crate::{metrics::MemMetrics, sources::SocInfo};
+use macmon_lib::metrics::{MemMetrics, Metrics, Sampler};
+use macmon_lib::sources::{SocInfo, get_soc_info};
 
 type WithError<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -46,15 +47,17 @@ struct FreqStore {
   items: Vec<u64>, // from 0 to 100
   top_value: u64,
   usage: f64, // from 0.0 to 1.0
+  units: u32,
 }
 
 impl FreqStore {
-  fn push(&mut self, value: u64, usage: f64) {
+  fn push(&mut self, value: u64, usage: f64, units: u32) {
     self.items.insert(0, (usage * 100.0) as u64);
     self.items.truncate(MAX_SPARKLINE);
 
     self.top_value = value;
     self.usage = usage;
+    self.units = units;
   }
 }
 
@@ -142,17 +145,6 @@ impl TempStore {
   }
 }
 
-// MARK: Components
-
-fn h_stack(area: Rect) -> (Rect, Rect) {
-  let ha = Layout::default()
-    .direction(Direction::Horizontal)
-    .constraints([Constraint::Fill(1), Constraint::Fill(1)].as_ref())
-    .split(area);
-
-  (ha[0], ha[1])
-}
-
 // MARK: Threads
 
 enum Event {
@@ -204,12 +196,15 @@ fn run_sampler_thread(tx: mpsc::Sender<Event>, msec: Arc<RwLock<u32>>) {
   std::thread::spawn(move || {
     let mut sampler = Sampler::new().unwrap();
 
-    // Send initial metrics
-    tx.send(Event::Update(sampler.get_metrics(100).unwrap())).unwrap();
-
     loop {
-      let msec = *msec.read().unwrap();
-      tx.send(Event::Update(sampler.get_metrics(msec).unwrap())).unwrap();
+      let update_started = Instant::now();
+      let interval = Duration::from_millis((*msec.read().unwrap()) as u64);
+      tx.send(Event::Update(sampler.get_metrics().unwrap())).unwrap();
+
+      let elapsed = update_started.elapsed();
+      if elapsed < interval {
+        std::thread::sleep(interval - elapsed);
+      }
     }
   });
 }
@@ -218,6 +213,11 @@ fn run_sampler_thread(tx: mpsc::Sender<Event>, msec: Arc<RwLock<u32>>) {
 // see: https://github.com/vladkens/macmon/issues/10
 fn avg2<T: num_traits::Float>(a: T, b: T) -> T {
   if a == T::zero() { b } else { (a + b) / T::from(2.0).unwrap() }
+}
+
+fn zero_div<T: core::ops::Div<Output = T> + Default + PartialEq>(a: T, b: T) -> T {
+  let zero: T = Default::default();
+  if b == zero { zero } else { a / b }
 }
 
 // MARK: App
@@ -232,36 +232,55 @@ pub struct App {
   cpu_power: PowerStore,
   gpu_power: PowerStore,
   ane_power: PowerStore,
-  all_power: PowerStore,
-  sys_power: PowerStore,
+  package_power: PowerStore,
+  board_power: PowerStore,
 
   cpu_temp: TempStore,
   gpu_temp: TempStore,
 
-  ecpu_freq: FreqStore,
-  pcpu_freq: FreqStore,
-  igpu_freq: FreqStore,
+  cpu_freqs: BTreeMap<String, FreqStore>,
+  gpu_freqs: BTreeMap<String, FreqStore>,
+  cpu_layout: String,
 }
 
 impl App {
   pub fn new() -> WithError<Self> {
-    let soc = SocInfo::new()?;
+    let soc = get_soc_info()?;
     let cfg = Config::load();
     Ok(Self { cfg, soc, ..Default::default() })
   }
 
   fn update_metrics(&mut self, data: Metrics) {
-    self.cpu_power.push(data.cpu_power as f64);
-    self.gpu_power.push(data.gpu_power as f64);
-    self.ane_power.push(data.ane_power as f64);
-    self.all_power.push(data.all_power as f64);
-    self.sys_power.push(data.sys_power as f64);
-    self.ecpu_freq.push(data.ecpu_usage.0 as u64, data.ecpu_usage.1 as f64);
-    self.pcpu_freq.push(data.pcpu_usage.0 as u64, data.pcpu_usage.1 as f64);
-    self.igpu_freq.push(data.gpu_usage.0 as u64, data.gpu_usage.1 as f64);
+    self.cpu_power.push(data.power.cpu as f64);
+    self.gpu_power.push(data.power.gpu as f64);
+    self.ane_power.push(data.power.ane as f64);
+    self.package_power.push(data.power.package as f64);
+    self.board_power.push(data.power.board as f64);
+    self.cpu_layout = data
+      .cpu_usage
+      .iter()
+      .map(|entry| entry.cores.len().to_string())
+      .collect::<Vec<_>>()
+      .join("+");
+    self.cpu_freqs.retain(|name, _| data.cpu_usage.iter().any(|entry| entry.name == *name));
+    self.gpu_freqs.retain(|name, _| data.gpu_usage.iter().any(|entry| entry.name == *name));
+    for entry in &data.cpu_usage {
+      self.cpu_freqs.entry(entry.name.clone()).or_default().push(
+        entry.freq_mhz as u64,
+        entry.usage as f64,
+        entry.cores.len() as u32,
+      );
+    }
+    for entry in &data.gpu_usage {
+      self.gpu_freqs.entry(entry.name.clone()).or_default().push(
+        entry.freq_mhz as u64,
+        entry.usage as f64,
+        entry.units,
+      );
+    }
 
-    self.cpu_temp.push(data.temp.cpu_temp_avg);
-    self.gpu_temp.push(data.temp.gpu_temp_avg);
+    self.cpu_temp.push(data.temp.cpu_avg);
+    self.gpu_temp.push(data.temp.gpu_avg);
 
     self.mem.push(data.memory);
   }
@@ -306,7 +325,7 @@ impl App {
   }
 
   fn render_freq_block(&self, f: &mut Frame, r: Rect, label: &str, val: &FreqStore) {
-    let label = format!("{} {:3.0}% @ {:4.0} MHz", label, val.usage * 100.0, val.top_value);
+    let label = format!("{} {:4.1}% @ {:4.0} MHz", label, val.usage * 100.0, val.top_value);
     let block = self.title_block(label.as_str(), "");
 
     match self.cfg.view_type {
@@ -328,6 +347,43 @@ impl App {
           .ratio(val.usage);
         f.render_widget(w, r);
       }
+    }
+  }
+
+  fn format_cluster_label(name: &str, units: u32) -> String {
+    let name = match name.ends_with("CPU") && !name.ends_with("-CPU") {
+      true => format!("{}-CPU", &name[..name.len() - 3]),
+      false => name.to_string(),
+    };
+
+    match units > 0 {
+      true => format!("{name}({units})"),
+      false => name,
+    }
+  }
+
+  fn render_empty_block(&self, f: &mut Frame, r: Rect, label: &str) {
+    let block = self.title_block(label, "");
+    f.render_widget(block, r);
+  }
+
+  fn render_freq_row(
+    &self,
+    f: &mut Frame,
+    r: Rect,
+    items: Vec<(&str, &FreqStore)>,
+    empty_label: &str,
+  ) {
+    if items.is_empty() {
+      self.render_empty_block(f, r, empty_label);
+      return;
+    }
+
+    let constraints = vec![Constraint::Fill(1); items.len()];
+    let areas =
+      Layout::default().direction(Direction::Horizontal).constraints(constraints).split(r);
+    for (idx, (name, store)) in items.iter().enumerate() {
+      self.render_freq_block(f, areas[idx], &Self::format_cluster_label(name, store.units), store);
     }
   }
 
@@ -365,14 +421,14 @@ impl App {
   }
 
   fn render(&mut self, f: &mut Frame) {
-    let label_l = format!(
-      "{} ({}E+{}P+{}GPU {}GB)",
-      self.soc.chip_name,
-      self.soc.ecpu_cores,
-      self.soc.pcpu_cores,
-      self.soc.gpu_cores,
-      self.soc.memory_gb,
-    );
+    let label_l = if self.cpu_layout.is_empty() {
+      format!("{} ({}GB)", self.soc.chip_name, self.soc.memory_gb)
+    } else {
+      format!(
+        "{} ({}CPU+{}GPU {}GB)",
+        self.soc.chip_name, self.cpu_layout, self.soc.gpu_cores, self.soc.memory_gb
+      )
+    };
 
     let rows = Layout::default()
       .direction(Direction::Vertical)
@@ -390,26 +446,44 @@ impl App {
       .split(iarea);
 
     // 1st row
-    let (c1, c2) = h_stack(iarea[0]);
-    self.render_freq_block(f, c1, "E-CPU", &self.ecpu_freq);
-    self.render_freq_block(f, c2, "P-CPU", &self.pcpu_freq);
+    let cpu_items =
+      self.cpu_freqs.iter().map(|(name, store)| (name.as_str(), store)).collect::<Vec<_>>();
+    self.render_freq_row(f, iarea[0], cpu_items, "CPU");
 
     // 2nd row
-    let (c1, c2) = h_stack(iarea[1]);
-    self.render_mem_block(f, c1, &self.mem);
-    self.render_freq_block(f, c2, "GPU", &self.igpu_freq);
+    let gpu_items =
+      self.gpu_freqs.iter().map(|(name, store)| (name.as_str(), store)).collect::<Vec<_>>();
+    let mut constraints = vec![Constraint::Fill(1)];
+    constraints.extend(vec![Constraint::Fill(1); gpu_items.len()]);
+    let row2 =
+      Layout::default().direction(Direction::Horizontal).constraints(constraints).split(iarea[1]);
+    self.render_mem_block(f, row2[0], &self.mem);
+    if gpu_items.is_empty() {
+      if row2.len() > 1 {
+        self.render_empty_block(f, row2[1], "GPU");
+      }
+    } else {
+      for (idx, (name, store)) in gpu_items.iter().enumerate() {
+        self.render_freq_block(
+          f,
+          row2[idx + 1],
+          &Self::format_cluster_label(name, store.units),
+          store,
+        );
+      }
+    }
 
     // 3rd row
     let label_l = format!(
       "Power: {:.2}W (avg {:.2}W, max {:.2}W)",
-      self.all_power.top_value, self.all_power.avg_value, self.all_power.max_value,
+      self.package_power.top_value, self.package_power.avg_value, self.package_power.max_value,
     );
 
     // Show label only if sensor is available
-    let label_r = if self.sys_power.top_value > 0.0 {
+    let label_r = if self.board_power.top_value > 0.0 {
       format!(
         "Total {:.2}W ({:.2}, {:.2})",
-        self.sys_power.top_value, self.sys_power.avg_value, self.sys_power.max_value
+        self.board_power.top_value, self.board_power.avg_value, self.board_power.max_value
       )
     } else {
       "".to_string()

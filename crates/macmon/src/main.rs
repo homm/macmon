@@ -1,13 +1,26 @@
 mod app;
 mod config;
 mod debug;
-mod metrics;
-mod sources;
 
 use app::App;
 use clap::{CommandFactory, Parser, Subcommand, parser::ValueSource};
-use metrics::Sampler;
+use macmon_lib::metrics::{Metrics, Sampler};
+use macmon_lib::sources::{SocInfo, get_soc_info};
+use serde::Serialize;
 use std::error::Error;
+use std::{
+  thread,
+  time::{Duration, Instant},
+};
+
+#[derive(Serialize)]
+struct PipeSample<'a> {
+  timestamp: &'a str,
+  #[serde(flatten)]
+  metrics: &'a Metrics,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  soc: Option<&'a SocInfo>,
+}
 
 #[derive(Debug, Subcommand)]
 enum Commands {
@@ -48,17 +61,24 @@ fn main() -> Result<(), Box<dyn Error>> {
       let mut sampler = Sampler::new()?;
       let mut counter = 0u32;
 
-      let soc_info_val = if *soc_info { Some(sampler.get_soc_info().clone()) } else { None };
+      let soc_info_val = if *soc_info { Some(get_soc_info()?) } else { None };
+      let interval = Duration::from_millis(args.interval as u64);
+      let mut last_update_started = Instant::now();
 
       loop {
-        let doc = sampler.get_metrics(args.interval.max(100))?;
-
-        let mut doc = serde_json::to_value(&doc)?;
-        if let Some(ref soc) = soc_info_val {
-          doc["soc"] = serde_json::to_value(soc)?;
+        let elapsed = last_update_started.elapsed();
+        if elapsed < interval {
+          thread::sleep(interval - elapsed);
         }
-        doc["timestamp"] = serde_json::to_value(chrono::Utc::now().to_rfc3339())?;
-        let doc = serde_json::to_string(&doc)?;
+        last_update_started = Instant::now();
+
+        let metrics = sampler.get_metrics()?;
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        let doc = serde_json::to_string(&PipeSample {
+          metrics: &metrics,
+          soc: soc_info_val.as_ref(),
+          timestamp: &timestamp,
+        })?;
 
         println!("{}", doc);
 
@@ -84,3 +104,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
   Ok(())
 }
+
+#[cfg(test)]
+#[path = "main_test.rs"]
+mod tests;

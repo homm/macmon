@@ -23,7 +23,7 @@ Apple Silicon processors don't provide an easy way to view live power consumptio
 
 - 🚫 Runs without sudo
 - ⚡ Real-time CPU / GPU / ANE power usage
-- 📊 CPU utilization per cluster
+- 📊 CPU utilization per reported CPU/GPU cluster
 - 💾 RAM / Swap usage
 - 📈 Historical charts with average and max values
 - 🌡️ Average CPU / GPU temperature
@@ -63,7 +63,7 @@ nix-env -i macmon
 Usage: macmon [OPTIONS] [COMMAND]
 
 Commands:
-  pipe   Output metrics in JSON format
+  pipe   Output metrics in JSON format (suitable for piping)
   debug  Print debug information
   help   Print this message or the help of the given subcommand(s)
 
@@ -80,7 +80,7 @@ Controls:
 
 ## 🚰 Piping
 
-You can use the `pipe` subcommand to output metrics in JSON format, which makes it suitable for piping into other tools or scripts. For example:
+You can use the `pipe` subcommand to print one compact JSON object per sample to stdout, which makes it suitable for piping into other tools or scripts. For example:
 
 ```sh
 macmon pipe | jq
@@ -96,31 +96,58 @@ macmon pipe -s 10 -i 500 | jq
 
 This will collect 10 samples with an update interval of 500 milliseconds.
 
+In `pipe` mode, CPU and GPU usage are emitted under `cpu_usage` and `gpu_usage`. CPU domains are keyed by domain name and include `units`, `freq_mhz`, `usage`, and `cores`, where `cores` is an array of `[freq_mhz, usage]` pairs for the cores that belong to that domain. GPU entries are keyed by cluster name and include `units`, `freq_mhz`, and `usage`.
+
 ### Output
 
 ```jsonc
 {
   "timestamp": "2025-02-24T20:38:15.427569+00:00",
+  "cpu_usage": {
+    "ECPU": {
+      "units": 4,
+      "freq_mhz": 1181,
+      "usage": 0.33062646,
+      "cores": [[1134, 0.21], [1228, 0.45], [1187, 0.31], [1175, 0.35]]
+    },
+    "PCPU": {
+      "units": 4,
+      "freq_mhz": 2014,
+      "usage": 0.11280674,
+      "cores": [[1987, 0.08], [2041, 0.14], [2013, 0.10], [2015, 0.12]]
+    },
+  },
+  "gpu_usage": {
+    "GPU": {
+      "units": 10,
+      "freq_mhz": 461,
+      "usage": 0.21497859
+    }
+  }
+  "power": {
+    "package": 0.22231553,                // SoC/package watts
+    "cpu": 0.20486385,                    // Watts
+    "gpu": 0.017451683,                   // Watts
+    "ram": 0.11635789,                    // Watts
+    "gpu_ram": 0.0009615385,              // Watts
+    "ane": 0.0,                           // Watts
+    "board": 5.876533,                    // System total watts
+    "battery": 0.0,                       // Battery rail watts
+    "dc_in": 0.0                          // External DC input watts
+  },
   "temp": {
-    "cpu_temp_avg": 43.73614,         // Celsius
-    "gpu_temp_avg": 36.95167          // Celsius
+    "cpu_avg": 43.73614,                  // Celsius
+    "gpu_avg": 36.95167                   // Celsius
   },
   "memory": {
-    "ram_total": 25769803776,         // Bytes
-    "ram_usage": 20985479168,         // Bytes
-    "swap_total": 4294967296,         // Bytes
-    "swap_usage": 2602434560          // Bytes
+    "ram_total": 25769803776,             // Bytes
+    "ram_usage": 20985479168,             // Bytes
+    "swap_total": 4294967296,             // Bytes
+    "swap_usage": 2602434560              // Bytes
   },
-  "ecpu_usage": [1181, 0.082656614],  // (Frequency MHz, Usage %)
-  "pcpu_usage": [1974, 0.015181795],  // (Frequency MHz, Usage %)
-  "gpu_usage": [461, 0.021497859],    // (Frequency MHz, Usage %)
-  "cpu_power": 0.20486385,            // Watts
-  "gpu_power": 0.017451683,           // Watts
-  "ane_power": 0.0,                   // Watts
-  "all_power": 0.22231553,            // Watts
-  "sys_power": 5.876533,              // Watts
-  "ram_power": 0.11635789,            // Watts
-  "gpu_ram_power": 0.0009615385       // Watts (not sure what it means)
+  "soc": {
+    "...": "present only when --soc-info is passed"
+  }
 }
 ```
 
