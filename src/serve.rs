@@ -35,13 +35,15 @@ fn to_prometheus(m: &Metrics, soc: &SocInfo) -> String {
   gauge!(out, "macmon_pcpu_usage_ratio", "Performance CPU cluster utilization (0–1)", m.pcpu_usage.1);
   gauge!(out, "macmon_gpu_freq_mhz", "GPU frequency in MHz", m.gpu_usage.0);
   gauge!(out, "macmon_gpu_usage_ratio", "GPU utilization (0–1)", m.gpu_usage.1);
-  gauge!(out, "macmon_cpu_power_watts", "CPU power consumption in Watts", m.cpu_power);
-  gauge!(out, "macmon_gpu_power_watts", "GPU power consumption in Watts", m.gpu_power);
-  gauge!(out, "macmon_ane_power_watts", "Apple Neural Engine power consumption in Watts", m.ane_power);
-  gauge!(out, "macmon_all_power_watts", "Combined CPU+GPU+ANE power consumption in Watts", m.all_power);
-  gauge!(out, "macmon_sys_power_watts", "Total system power consumption in Watts", m.sys_power);
-  gauge!(out, "macmon_ram_power_watts", "RAM power consumption in Watts", m.ram_power);
-  gauge!(out, "macmon_gpu_ram_power_watts", "GPU RAM power consumption in Watts", m.gpu_ram_power);
+  gauge!(out, "macmon_power_package_watts", "SoC/package power consumption in Watts", m.power.package);
+  gauge!(out, "macmon_power_cpu_watts", "CPU power consumption in Watts", m.power.cpu);
+  gauge!(out, "macmon_power_gpu_watts", "GPU power consumption in Watts", m.power.gpu);
+  gauge!(out, "macmon_power_ram_watts", "RAM power consumption in Watts", m.power.ram);
+  gauge!(out, "macmon_power_gpu_ram_watts", "GPU RAM power consumption in Watts", m.power.gpu_ram);
+  gauge!(out, "macmon_power_ane_watts", "Apple Neural Engine power consumption in Watts", m.power.ane);
+  gauge!(out, "macmon_power_board_watts", "Total system power consumption in Watts", m.power.board);
+  gauge!(out, "macmon_power_battery_watts", "Battery rail power in Watts", m.power.battery);
+  gauge!(out, "macmon_power_dc_in_watts", "External DC input power in Watts", m.power.dc_in);
   out
 }
 

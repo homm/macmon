@@ -117,13 +117,17 @@ This will collect 10 samples with an update interval of 500 milliseconds.
   "pcpu_usage": [1974, 0.015181795],  // (Frequency MHz, Usage %)
   "cpu_usage_pct": 0.036854,          // Combined CPU usage (weighted by core count, 0–1)
   "gpu_usage": [461, 0.021497859],    // (Frequency MHz, Usage %)
-  "cpu_power": 0.20486385,            // Watts
-  "gpu_power": 0.017451683,           // Watts
-  "ane_power": 0.0,                   // Watts
-  "all_power": 0.22231553,            // Watts
-  "sys_power": 5.876533,              // Watts
-  "ram_power": 0.11635789,            // Watts
-  "gpu_ram_power": 0.0009615385       // Watts (not sure what it means)
+  "power": {
+    "package": 0.3396353,             // SoC/package watts
+    "cpu": 0.20486385,                // Watts
+    "gpu": 0.017451683,               // Watts
+    "ram": 0.11635789,                // Watts
+    "gpu_ram": 0.0009615385,          // Watts
+    "ane": 0.0,                       // Watts
+    "board": 5.876533,                // System total watts
+    "battery": 0.0,                   // Battery rail watts
+    "dc_in": 0.0                      // External DC input watts
+  }
 }
 ```
 
@@ -190,7 +194,7 @@ Grafana login:
 Then import or build a Grafana dashboard querying metrics such as:
 
 ```
-macmon_cpu_power_watts{chip="Apple M3 Pro"}
+macmon_power_cpu_watts{chip="Apple M3 Pro"}
 macmon_ecpu_usage_ratio{chip="Apple M3 Pro"}
 macmon_memory_ram_used_bytes{chip="Apple M3 Pro"}
 ```
@@ -202,9 +206,9 @@ macmon_memory_ram_used_bytes{chip="Apple M3 Pro"}
 # TYPE macmon_cpu_temp_celsius gauge
 macmon_cpu_temp_celsius{chip="Apple M3 Pro"} 47.3
 
-# HELP macmon_cpu_power_watts CPU power consumption in Watts
-# TYPE macmon_cpu_power_watts gauge
-macmon_cpu_power_watts{chip="Apple M3 Pro"} 8.42
+# HELP macmon_power_cpu_watts CPU power consumption in Watts
+# TYPE macmon_power_cpu_watts gauge
+macmon_power_cpu_watts{chip="Apple M3 Pro"} 8.42
 
 # HELP macmon_cpu_usage_ratio Combined CPU utilization (0–1), weighted by core count
 # TYPE macmon_cpu_usage_ratio gauge
@@ -237,8 +241,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // collect metrics over a 1000ms window
     let metrics = sampler.get_metrics(1000)?;
 
-    println!("CPU power:  {:.2} W", metrics.cpu_power);
-    println!("GPU power:  {:.2} W", metrics.gpu_power);
+    println!("CPU power:  {:.2} W", metrics.power.cpu);
+    println!("GPU power:  {:.2} W", metrics.power.gpu);
     println!("CPU temp:   {:.1} °C", metrics.temp.cpu_temp_avg);
     println!("RAM usage:  {} / {} bytes", metrics.memory.ram_usage, metrics.memory.ram_total);
     println!("eCPU:       {} MHz  {:.1}%", metrics.ecpu_usage.0, metrics.ecpu_usage.1 * 100.0);

@@ -28,6 +28,19 @@ pub struct MemMetrics {
 }
 
 #[derive(Debug, Default, Serialize)]
+pub struct PowerMetrics {
+  pub package: f32, // SoC/package power reported by the sampler.
+  pub cpu: f32,     // CPU power included in `package`.
+  pub gpu: f32,     // GPU core power included in `package`.
+  pub ram: f32,     // DRAM power included in `package`.
+  pub gpu_ram: f32, // GPU SRAM power included in `package`.
+  pub ane: f32,     // ANE power included in `package`.
+  pub board: f32,   // System Total (`PSTR`), independent from battery/DC-in readings.
+  pub battery: f32, // Battery rail power (`PPBR`).
+  pub dc_in: f32,   // External DC input power (`PDTR`).
+}
+
+#[derive(Debug, Default, Serialize)]
 pub struct Metrics {
   pub temp: TempMetrics,
   pub memory: MemMetrics,
@@ -35,13 +48,7 @@ pub struct Metrics {
   pub pcpu_usage: (u32, f32), // freq MHz, usage ratio
   pub cpu_usage_pct: f32,     // combined ecpu+pcpu usage, weighted by core count
   pub gpu_usage: (u32, f32),  // freq MHz, usage ratio
-  pub cpu_power: f32,         // Watts
-  pub gpu_power: f32,         // Watts
-  pub ane_power: f32,         // Watts
-  pub all_power: f32,         // Watts
-  pub sys_power: f32,         // Watts
-  pub ram_power: f32,         // Watts
-  pub gpu_ram_power: f32,     // Watts
+  pub power: PowerMetrics,
 }
 
 // MARK: Helpers
@@ -245,10 +252,6 @@ impl Sampler {
     Ok(MemMetrics { ram_total, ram_usage, swap_total, swap_usage })
   }
 
-  fn get_sys_power(&mut self) -> WithError<f32> {
-    self.smc.read_float_val("PSTR")
-  }
-
   pub fn get_metrics(&mut self) -> WithError<Metrics> {
     // CPU Stats channel naming by chip family (see: https://github.com/vladkens/macmon/issues/47)
     //   M1-M4:  ECPU* = efficiency cores (lower tier)
@@ -290,13 +293,13 @@ impl Sampler {
 
       if x.group == "Energy Model" {
         match x.channel.as_str() {
-          "GPU Energy" => rs.gpu_power += x.watts()?,
+          "GPU Energy" => rs.power.gpu += x.watts()?,
           // "CPU Energy" for Basic / Max, "DIE_{}_CPU Energy" for Ultra
-          c if c.ends_with("CPU Energy") => rs.cpu_power += x.watts()?,
+          c if c.ends_with("CPU Energy") => rs.power.cpu += x.watts()?,
           // same pattern next keys: "ANE" for Basic, "ANE0" for Max, "ANE0_{}" for Ultra
-          c if c.starts_with("ANE") => rs.ane_power += x.watts()?,
-          c if c.starts_with("DRAM") => rs.ram_power += x.watts()?,
-          c if c.starts_with("GPU SRAM") => rs.gpu_ram_power += x.watts()?,
+          c if c.starts_with("ANE") => rs.power.ane += x.watts()?,
+          c if c.starts_with("DRAM") => rs.power.ram += x.watts()?,
+          c if c.starts_with("GPU SRAM") => rs.power.gpu_ram += x.watts()?,
           _ => {}
         }
       }
@@ -312,15 +315,14 @@ impl Sampler {
     let tcores = ecores + pcores;
 
     rs.cpu_usage_pct = zero_div(rs.ecpu_usage.1 * ecores + rs.pcpu_usage.1 * pcores, tcores);
-    rs.all_power = rs.cpu_power + rs.gpu_power + rs.ane_power;
+    rs.power.package = rs.power.cpu + rs.power.gpu + rs.power.ane + rs.power.ram + rs.power.gpu_ram;
 
     rs.memory = self.get_mem()?;
     rs.temp = self.get_temp()?;
 
-    rs.sys_power = match self.get_sys_power() {
-      Ok(val) => val.max(rs.all_power),
-      Err(_) => 0.0,
-    };
+    rs.power.board = self.smc.read_float_val("PSTR").unwrap_or(0.0);
+    rs.power.battery = self.smc.read_float_val("PPBR").unwrap_or(0.0);
+    rs.power.dc_in = self.smc.read_float_val("PDTR").unwrap_or(0.0);
 
     Ok(rs)
   }

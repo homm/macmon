@@ -255,8 +255,8 @@ pub struct App {
   cpu_power: PowerStore,
   gpu_power: PowerStore,
   ane_power: PowerStore,
-  all_power: PowerStore,
-  sys_power: PowerStore,
+  package_power: PowerStore,
+  board_power: PowerStore,
 
   cpu_temp: TempStore,
   gpu_temp: TempStore,
@@ -274,11 +274,11 @@ impl App {
   }
 
   fn update_metrics(&mut self, data: Metrics) {
-    self.cpu_power.push(data.cpu_power as f64);
-    self.gpu_power.push(data.gpu_power as f64);
-    self.ane_power.push(data.ane_power as f64);
-    self.all_power.push(data.all_power as f64);
-    self.sys_power.push(data.sys_power as f64);
+    self.cpu_power.push(data.power.cpu as f64);
+    self.gpu_power.push(data.power.gpu as f64);
+    self.ane_power.push(data.power.ane as f64);
+    self.package_power.push(data.power.package as f64);
+    self.board_power.push(data.power.board as f64);
     self.ecpu_freq.push(data.ecpu_usage.0 as u64, data.ecpu_usage.1 as f64);
     self.pcpu_freq.push(data.pcpu_usage.0 as u64, data.pcpu_usage.1 as f64);
     self.igpu_freq.push(data.gpu_usage.0 as u64, data.gpu_usage.1 as f64);
@@ -433,14 +433,14 @@ impl App {
     // 3rd row
     let label_l = format!(
       "Power: {:.2}W (avg {:.2}W, max {:.2}W)",
-      self.all_power.top_value, self.all_power.avg_value, self.all_power.max_value,
+      self.package_power.top_value, self.package_power.avg_value, self.package_power.max_value,
     );
 
     // Show label only if sensor is available
-    let label_r = if self.sys_power.top_value > 0.0 {
+    let label_r = if self.board_power.top_value > 0.0 {
       format!(
         "Total {:.2}W ({:.2}, {:.2})",
-        self.sys_power.top_value, self.sys_power.avg_value, self.sys_power.max_value
+        self.board_power.top_value, self.board_power.avg_value, self.board_power.max_value
       )
     } else {
       "".to_string()
