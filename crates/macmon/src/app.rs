@@ -11,11 +11,8 @@ use ratatui::crossterm::{
 use ratatui::{prelude::*, widgets::*};
 
 use crate::config::{Config, INTERVAL_INIT_SAMPLE, INTERVAL_MIN, INTERVAL_TUI_MAX, ViewType};
-use crate::metrics::{Metrics, Sampler, zero_div};
-use crate::{
-  metrics::MemMetrics,
-  sources::{SocInfo, get_soc_info},
-};
+use macmon_lib::metrics::{MemMetrics, Metrics, Sampler, zero_div};
+use macmon_lib::sources::{SocInfo, get_soc_info};
 
 type WithError<T> = Result<T, Box<dyn std::error::Error>>;
 

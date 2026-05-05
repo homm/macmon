@@ -1,48 +1,18 @@
-[package]
-name = "macmon"
+[workspace]
+members = ["crates/lib", "crates/macmon"]
+resolver = "2"
+
+[workspace.package]
 version = "0.7.2"
 edition = "2024"
-autobenches = false
-description = "Apple Silicon system monitor & Rust library — CPU/GPU power, temperature, RAM. No sudo. TUI, JSON pipe, Prometheus exporter."
 authors = ["vladkens"]
 license = "MIT"
 repository = "https://github.com/vladkens/macmon"
 homepage = "https://github.com/vladkens/macmon"
 documentation = "https://docs.rs/macmon"
 readme = "readme.md"
-include = ["src/**", "Cargo.toml", "Cargo.lock", "LICENSE", "readme.md"]
-keywords = ["macos", "apple-silicon", "monitoring", "prometheus", "tui"]
-categories = ["command-line-utilities", "hardware-support", "visualization"]
-[package.metadata.docs.rs]
-targets = ["aarch64-apple-darwin"]
 
-[features]
-bench = []
-
-[lib]
-name = "macmon"
-path = "src/lib.rs"
-
-[[bin]]
-name = "macmon"
-path = "src/main.rs"
-
-[lints.rust]
-non_camel_case_types = "allow"
-unreachable_code = "allow"
-unused_assignments = "allow"
-unused_imports = "deny"
-
-[lints.clippy]
-needless_range_loop = "allow"
-single_match = "allow"
-
-[profile.release]
-panic = "abort"
-strip = false
-lto = false
-
-[dependencies]
+[workspace.dependencies]
 chrono = "0.4.44"
 clap = { version = "4.6.1", features = ["derive"] }
 core-foundation = "0.10.1"
@@ -53,10 +23,17 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde-inline-default = "1.0.1"
 serde_json = "1.0.149"
 
-[dev-dependencies]
-divan = "0.1.21"
+[workspace.lints.rust]
+non_camel_case_types = "allow"
+unreachable_code = "allow"
+unused_assignments = "allow"
+unused_imports = "deny"
 
-[[bench]]
-name = "bench"
-harness = false
-required-features = ["bench"]
+[workspace.lints.clippy]
+needless_range_loop = "allow"
+single_match = "allow"
+
+[profile.release]
+panic = "abort"
+strip = false
+lto = false

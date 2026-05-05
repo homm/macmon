@@ -838,12 +838,22 @@ dependencies = [
  "chrono",
  "clap",
  "core-foundation",
- "divan",
- "libc",
+ "macmon-lib",
  "num-traits",
  "ratatui",
  "serde",
  "serde-inline-default",
+ "serde_json",
+]
+
+[[package]]
+name = "macmon-lib"
+version = "0.7.2"
+dependencies = [
+ "core-foundation",
+ "divan",
+ "libc",
+ "serde",
  "serde_json",
 ]
 

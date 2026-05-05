@@ -24,7 +24,7 @@ jobs:
 
       - run: rustup update --no-self-update stable && rustup default stable
       - run: cargo fmt --check
-      - run: cargo build --release --locked
+      - run: cargo build --workspace --release --locked
 
       - name: Check Cargo.toml version matches tag
         run: |

@@ -253,7 +253,7 @@ Add it to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-macmon = { git = "https://github.com/vladkens/macmon" }
+macmon = { package = "macmon-lib", git = "https://github.com/vladkens/macmon" }
 ```
 
 Then use the `Sampler` to collect metrics:
@@ -264,8 +264,7 @@ use macmon::Sampler;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut sampler = Sampler::new()?;
 
-    // collect metrics over a 1000ms window
-    let metrics = sampler.get_metrics(1000)?;
+    let metrics = sampler.get_metrics()?;
 
     println!("CPU power:  {:.2} W", metrics.power.cpu);
     println!("GPU power:  {:.2} W", metrics.power.gpu);
@@ -282,7 +281,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The `get_metrics(duration_ms)` call blocks for `duration_ms` milliseconds while sampling the hardware counters and returns a single averaged [`Metrics`](src/metrics.rs) snapshot.
+The `get_metrics()` call returns a single averaged [`Metrics`](crates/lib/src/metrics.rs) snapshot.
 
 ## 📦 Build from Source
 

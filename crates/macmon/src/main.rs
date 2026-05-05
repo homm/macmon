@@ -1,6 +1,7 @@
+use crate::app::App;
+use crate::config::INTERVAL_MIN;
 use clap::{CommandFactory, Parser, Subcommand, parser::ValueSource};
-use macmon::config::INTERVAL_MIN;
-use macmon::{App, Sampler, debug, get_soc_info};
+use macmon_lib::{Sampler, get_soc_info};
 use std::error::Error;
 use std::sync::{Arc, RwLock};
 use std::{
@@ -8,6 +9,9 @@ use std::{
   time::{Duration, Instant},
 };
 
+mod app;
+mod config;
+mod debug;
 mod serve;
 
 #[derive(Debug, Subcommand)]

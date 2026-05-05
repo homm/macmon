@@ -3,7 +3,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, RwLock};
 use std::thread;
 
-use macmon::{Metrics, SocInfo};
+use macmon_lib::{Metrics, SocInfo};
 
 pub type SharedMetrics = Arc<RwLock<Option<Metrics>>>;
 

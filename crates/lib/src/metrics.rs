@@ -125,8 +125,10 @@ fn calc_cluster_usage_at_peak_freq(cores: &[CoreUsageEntry]) -> (u32, f32) {
   }
 
   let peak_freq = peak_freq as f32;
-  let usage =
-    zero_div(cores.iter().map(|x| x.usage * x.freq_mhz as f32 / peak_freq).sum(), cores.len() as f32);
+  let usage = zero_div(
+    cores.iter().map(|x| x.usage * x.freq_mhz as f32 / peak_freq).sum(),
+    cores.len() as f32,
+  );
 
   (peak_freq as u32, usage)
 }
@@ -167,12 +169,7 @@ pub(crate) fn init_smc() -> WithError<(SMC, Vec<String>, Vec<String>)> {
   Ok((smc, cpu_sensors, gpu_sensors))
 }
 
-pub(crate) fn ioreport_channels_filter(
-  group: &str,
-  subgroup: &str,
-  channel: &str,
-  _unit: &str,
-) -> bool {
+pub fn ioreport_channels_filter(group: &str, subgroup: &str, channel: &str, _unit: &str) -> bool {
   // Keep this filter in sync with the channel handling in Sampler::get_metrics.
   if group == "Energy Model" {
     return channel == "GPU Energy"
@@ -298,13 +295,14 @@ impl Sampler {
 
     for x in self.ior.get_sample() {
       // Keep this channel handling in sync with ioreport_channels_filter.
-      if x.group == "CPU Stats" && x.subgroup == CPU_FREQ_CORE_SUBG {
-        if let Some(domain_idx) = cpu_channel_domain_index(&x.channel, &cpu_domains) {
-          let domain = &cpu_domains[domain_idx];
-          let (freq_mhz, usage) = calc_freq(x.item, &domain.freqs_mhz);
-          cpu_domain_cores[domain_idx].push(CoreUsageEntry { freq_mhz, usage });
-          continue;
-        }
+      if x.group == "CPU Stats"
+        && x.subgroup == CPU_FREQ_CORE_SUBG
+        && let Some(domain_idx) = cpu_channel_domain_index(&x.channel, &cpu_domains)
+      {
+        let domain = &cpu_domains[domain_idx];
+        let (freq_mhz, usage) = calc_freq(x.item, &domain.freqs_mhz);
+        cpu_domain_cores[domain_idx].push(CoreUsageEntry { freq_mhz, usage });
+        continue;
       }
 
       if x.group == "GPU Stats" && x.subgroup == GPU_FREQ_DICE_SUBG {
@@ -412,10 +410,8 @@ mod tests {
 
   #[test]
   fn calc_cluster_usage_at_peak_freq_preserves_idle_frequency() {
-    let cores = [
-      CoreUsageEntry { freq_mhz: 0, usage: 0.0 },
-      CoreUsageEntry { freq_mhz: 0, usage: 0.0 },
-    ];
+    let cores =
+      [CoreUsageEntry { freq_mhz: 0, usage: 0.0 }, CoreUsageEntry { freq_mhz: 0, usage: 0.0 }];
     let (freq, usage) = calc_cluster_usage_at_peak_freq(&cores);
 
     assert_eq!(freq, 0);

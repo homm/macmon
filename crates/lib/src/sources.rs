@@ -160,7 +160,7 @@ fn cfio_get_channel(item: CFDictionaryRef) -> String {
 fn cfio_channel_matches(items: &[(&str, Option<&str>)], group: &str, subgroup: &str) -> bool {
   items.is_empty()
     || items.iter().any(|(item_group, item_subgroup)| {
-      *item_group == group && item_subgroup.map_or(true, |value| value == subgroup)
+      *item_group == group && item_subgroup.is_none_or(|value| value == subgroup)
     })
 }
 
