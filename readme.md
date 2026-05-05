@@ -104,8 +104,8 @@ This will collect 10 samples with an update interval of 500 milliseconds.
 {
   "timestamp": "2025-02-24T20:38:15.427569+00:00",
   "temp": {
-    "cpu_temp_avg": 43.73614,         // Celsius
-    "gpu_temp_avg": 36.95167          // Celsius
+    "cpu_avg": 43.73614,              // Celsius
+    "gpu_avg": 36.95167               // Celsius
   },
   "memory": {
     "ram_total": 25769803776,         // Bytes
@@ -113,17 +113,38 @@ This will collect 10 samples with an update interval of 500 milliseconds.
     "swap_total": 4294967296,         // Bytes
     "swap_usage": 2602434560          // Bytes
   },
-  "ecpu_usage": [1181, 0.082656614],  // (Frequency MHz, Usage %)
-  "pcpu_usage": [1974, 0.015181795],  // (Frequency MHz, Usage %)
-  "cpu_usage_pct": 0.036854,          // Combined CPU usage (weighted by core count, 0–1)
-  "gpu_usage": [461, 0.021497859],    // (Frequency MHz, Usage %)
-  "cpu_power": 0.20486385,            // Watts
-  "gpu_power": 0.017451683,           // Watts
-  "ane_power": 0.0,                   // Watts
-  "all_power": 0.22231553,            // Watts
-  "sys_power": 5.876533,              // Watts
-  "ram_power": 0.11635789,            // Watts
-  "gpu_ram_power": 0.0009615385       // Watts (not sure what it means)
+  "cpu_usage": {
+    "ECPU": {
+      "units": 4,
+      "freq_mhz": 1181,
+      "usage": 0.33062646,
+      "cores": [[1134, 0.21], [1228, 0.45], [1187, 0.31], [1175, 0.35]]
+    },
+    "PCPU": {
+      "units": 8,
+      "freq_mhz": 1974,
+      "usage": 0.015181795,
+      "cores": [[1974, 0.015181795]]
+    }
+  },
+  "gpu_usage": {
+    "GPUPH": {
+      "units": 20,
+      "freq_mhz": 461,
+      "usage": 0.021497859
+    }
+  },
+  "power": {
+    "package": 0.3396353,             // SoC/package watts
+    "cpu": 0.20486385,                // Watts
+    "gpu": 0.017451683,               // Watts
+    "ram": 0.11635789,                // Watts
+    "gpu_ram": 0.0009615385,          // Watts
+    "ane": 0.0,                       // Watts
+    "board": 5.876533,                // System total watts
+    "battery": 0.0,                   // Battery rail watts
+    "dc_in": 0.0                      // External DC input watts
+  }
 }
 ```
 
@@ -190,8 +211,9 @@ Grafana login:
 Then import or build a Grafana dashboard querying metrics such as:
 
 ```
-macmon_cpu_power_watts{chip="Apple M3 Pro"}
-macmon_ecpu_usage_ratio{chip="Apple M3 Pro"}
+macmon_power_cpu_watts{chip="Apple M3 Pro"}
+macmon_cpu_usage_ratio{chip="Apple M3 Pro",domain="ECPU"}
+macmon_gpu_usage_ratio{chip="Apple M3 Pro",domain="GPUPH"}
 macmon_memory_ram_used_bytes{chip="Apple M3 Pro"}
 ```
 
@@ -202,17 +224,25 @@ macmon_memory_ram_used_bytes{chip="Apple M3 Pro"}
 # TYPE macmon_cpu_temp_celsius gauge
 macmon_cpu_temp_celsius{chip="Apple M3 Pro"} 47.3
 
-# HELP macmon_cpu_power_watts CPU power consumption in Watts
-# TYPE macmon_cpu_power_watts gauge
-macmon_cpu_power_watts{chip="Apple M3 Pro"} 8.42
+# HELP macmon_power_cpu_watts CPU power consumption in Watts
+# TYPE macmon_power_cpu_watts gauge
+macmon_power_cpu_watts{chip="Apple M3 Pro"} 8.42
 
-# HELP macmon_cpu_usage_ratio Combined CPU utilization (0–1), weighted by core count
+# HELP macmon_cpu_usage_freq_mhz CPU domain frequency in MHz
+# TYPE macmon_cpu_usage_freq_mhz gauge
+macmon_cpu_usage_freq_mhz{chip="Apple M3 Pro",domain="ECPU"} 1181
+
+# HELP macmon_cpu_usage_ratio CPU domain utilization (0–1)
 # TYPE macmon_cpu_usage_ratio gauge
-macmon_cpu_usage_ratio{chip="Apple M3 Pro"} 0.037
+macmon_cpu_usage_ratio{chip="Apple M3 Pro",domain="ECPU"} 0.083
 
-# HELP macmon_ecpu_usage_ratio Efficiency CPU cluster utilization (0–1)
-# TYPE macmon_ecpu_usage_ratio gauge
-macmon_ecpu_usage_ratio{chip="Apple M3 Pro"} 0.083
+# HELP macmon_gpu_usage_freq_mhz GPU domain frequency in MHz
+# TYPE macmon_gpu_usage_freq_mhz gauge
+macmon_gpu_usage_freq_mhz{chip="Apple M3 Pro",domain="GPUPH"} 461
+
+# HELP macmon_gpu_usage_ratio GPU domain utilization (0–1)
+# TYPE macmon_gpu_usage_ratio gauge
+macmon_gpu_usage_ratio{chip="Apple M3 Pro",domain="GPUPH"} 0.021
 ```
 
 ## 📚 Library Usage
@@ -223,7 +253,7 @@ Add it to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-macmon = { git = "https://github.com/vladkens/macmon" }
+macmon = { package = "macmon-lib", git = "https://github.com/vladkens/macmon" }
 ```
 
 Then use the `Sampler` to collect metrics:
@@ -234,21 +264,24 @@ use macmon::Sampler;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut sampler = Sampler::new()?;
 
-    // collect metrics over a 1000ms window
-    let metrics = sampler.get_metrics(1000)?;
+    let metrics = sampler.get_metrics()?;
 
-    println!("CPU power:  {:.2} W", metrics.cpu_power);
-    println!("GPU power:  {:.2} W", metrics.gpu_power);
-    println!("CPU temp:   {:.1} °C", metrics.temp.cpu_temp_avg);
+    println!("CPU power:  {:.2} W", metrics.power.cpu);
+    println!("GPU power:  {:.2} W", metrics.power.gpu);
+    println!("CPU temp:   {:.1} °C", metrics.temp.cpu_avg);
     println!("RAM usage:  {} / {} bytes", metrics.memory.ram_usage, metrics.memory.ram_total);
-    println!("eCPU:       {} MHz  {:.1}%", metrics.ecpu_usage.0, metrics.ecpu_usage.1 * 100.0);
-    println!("pCPU:       {} MHz  {:.1}%", metrics.pcpu_usage.0, metrics.pcpu_usage.1 * 100.0);
+    for domain in &metrics.cpu_usage {
+        println!("{}:       {} MHz  {:.1}%", domain.name, domain.freq_mhz, domain.usage * 100.0);
+    }
+    for domain in &metrics.gpu_usage {
+        println!("{}:       {} MHz  {:.1}%", domain.name, domain.freq_mhz, domain.usage * 100.0);
+    }
 
     Ok(())
 }
 ```
 
-The `get_metrics(duration_ms)` call blocks for `duration_ms` milliseconds while sampling the hardware counters and returns a single averaged [`Metrics`](src/metrics.rs) snapshot.
+The `get_metrics()` call returns a single averaged [`Metrics`](crates/lib/src/metrics.rs) snapshot.
 
 ## 📦 Build from Source
 

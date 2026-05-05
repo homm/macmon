@@ -160,7 +160,7 @@ fn cfio_get_channel(item: CFDictionaryRef) -> String {
 fn cfio_channel_matches(items: &[(&str, Option<&str>)], group: &str, subgroup: &str) -> bool {
   items.is_empty()
     || items.iter().any(|(item_group, item_subgroup)| {
-      *item_group == group && item_subgroup.map_or(true, |value| value == subgroup)
+      *item_group == group && item_subgroup.is_none_or(|value| value == subgroup)
     })
 }
 
@@ -401,17 +401,30 @@ pub fn libc_swap() -> WithError<(u64, u64)> {
 
 // MARK: SockInfo
 
+struct CpuDomainBinding {
+  channel_prefix: &'static str,
+  pmgr_key: &'static str,
+}
+
+const CPU_DOMAIN_BINDINGS: [CpuDomainBinding; 3] = [
+  CpuDomainBinding { channel_prefix: "ECPU", pmgr_key: "voltage-states1-sram" },
+  CpuDomainBinding { channel_prefix: "PCPU", pmgr_key: "voltage-states5-sram" },
+  CpuDomainBinding { channel_prefix: "MCPU", pmgr_key: "voltage-states1-sram" },
+];
+
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct CpuDomainInfo {
+  pub name: String,
+  pub units: u32,
+  pub freqs_mhz: Vec<u32>,
+}
+
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct SocInfo {
   pub mac_model: String,
   pub chip_name: String,
   pub memory_gb: u16,
-  pub ecpu_cores: u8,
-  pub pcpu_cores: u8,
-  pub ecpu_label: String, // "E" on M1-M4, "P" on M5+
-  pub pcpu_label: String, // "P" on M1-M4, "S" on M5+
-  pub ecpu_freqs: Vec<u32>,
-  pub pcpu_freqs: Vec<u32>,
+  pub cpu_domains: Vec<CpuDomainInfo>,
   pub gpu_cores: u8,
   pub gpu_freqs: Vec<u32>,
 }
@@ -505,20 +518,49 @@ fn cpu_freqs(item: CFDictionaryRef, key: &str, is_ecpu: bool, scale: u32) -> Opt
   Some(to_mhz(freqs, scale))
 }
 
-// Parse "proc T:P:E" (macOS 15) or "proc T:P_or_S:E:M" (macOS 26+) into (ecpu, pcpu, has_mcpu).
-// macOS 26 always uses 4 fields; M5+ has M>0 (ecpu=M, pcpu=S), M1-M4 has M=0 (ecpu=E, pcpu=P).
-fn parse_cpu_cores(s: &str) -> (u64, u64, bool) {
+fn set_cpu_domain_units(units: &mut [u64], channel_prefix: &str, value: u64) {
+  if let Some(idx) =
+    CPU_DOMAIN_BINDINGS.iter().position(|binding| binding.channel_prefix == channel_prefix)
+  {
+    units[idx] = value;
+  }
+}
+
+// Parse "proc T:P:E" (macOS 15) or "proc T:S:E:M" (macOS 26+) into public CPU domain units.
+// M5+ reports M>0, where IOReport uses MCPU for the mid-tier domain and PCPU for super cores.
+fn parse_cpu_domain_units(s: &str) -> Vec<u64> {
+  let mut units = vec![0; CPU_DOMAIN_BINDINGS.len()];
   let procs = s.strip_prefix("proc ").unwrap_or("");
   let parts: Vec<u64> = procs.split(':').map(|x| x.parse().unwrap_or(0)).collect();
 
   match parts.len() {
     4 => {
-      let (e, m) = (parts[2], parts[3]);
-      if m > 0 { (m, parts[1], true) } else { (e, parts[1], false) }
+      set_cpu_domain_units(&mut units, "PCPU", parts[1]);
+      set_cpu_domain_units(&mut units, "ECPU", parts[2]);
+      set_cpu_domain_units(&mut units, "MCPU", parts[3]);
     }
-    3 => (parts[2], parts[1], false), // macOS 15: "proc total:P:E"
-    _ => (0, 0, false),
+    3 => {
+      set_cpu_domain_units(&mut units, "PCPU", parts[1]);
+      set_cpu_domain_units(&mut units, "ECPU", parts[2]);
+    }
+    _ => {}
   }
+
+  units
+}
+
+fn build_cpu_domains(domain_units: Vec<u64>, freq_tables: Vec<Vec<u32>>) -> Vec<CpuDomainInfo> {
+  CPU_DOMAIN_BINDINGS
+    .iter()
+    .zip(domain_units)
+    .zip(freq_tables)
+    .filter(|((_, units), _)| *units > 0)
+    .map(|((binding, units), freqs_mhz)| CpuDomainInfo {
+      name: binding.channel_prefix.to_string(),
+      units: units as u32,
+      freqs_mhz,
+    })
+    .collect()
 }
 
 pub fn get_soc_info() -> WithError<SocInfo> {
@@ -550,7 +592,7 @@ fn load_soc_info() -> WithError<SocInfo> {
 
   // SPHardwareDataType.0.number_processors -> "proc x:y:z" or "proc x:y:z:w"
   let number_processors = out["SPHardwareDataType"][0]["number_processors"].as_str().unwrap_or("");
-  let (ecpu_cores, pcpu_cores, has_mcpu) = parse_cpu_cores(number_processors);
+  let cpu_domain_units = parse_cpu_domain_units(number_processors);
 
   // SPDisplaysDataType.0.sppci_cores
   let gpu_cores = out["SPDisplaysDataType"][0]["sppci_cores"].as_str();
@@ -559,28 +601,24 @@ fn load_soc_info() -> WithError<SocInfo> {
   let cpu_scale = cpu_freq_scale(&chip_name);
   let gpu_scale: u32 = 1000 * 1000; // MHz
 
-  // Assign parsed values to info
   info.chip_name = chip_name;
   info.mac_model = mac_model;
   info.memory_gb = mem_gb as u16;
   info.gpu_cores = gpu_cores as u8;
-  info.ecpu_cores = ecpu_cores as u8;
-  info.pcpu_cores = pcpu_cores as u8;
-  info.ecpu_label = if has_mcpu { "P".into() } else { "E".into() };
-  info.pcpu_label = if has_mcpu { "S".into() } else { "P".into() };
 
   // CPU frequencies
+  let mut cpu_freq_tables = vec![Vec::new(); cpu_domain_units.len()];
   for (entry, name) in IOServiceIterator::new("AppleARMIODevice")? {
     if name == "pmgr" {
       let item = cfio_get_props(entry, name)?;
       // 1) `strings /usr/bin/powermetrics | grep voltage-states` uses non-sram keys
       //    but their values are zero, so sram used here; it looks valid.
       // 2) sudo powermetrics --samplers cpu_power -i 1000 -n 1 | grep "active residency" | grep "Cluster"
-      if let Some(f) = cpu_freqs(item, "voltage-states1-sram", true, cpu_scale) {
-        info.ecpu_freqs = f;
-      }
-      if let Some(f) = cpu_freqs(item, "voltage-states5-sram", false, cpu_scale) {
-        info.pcpu_freqs = f;
+      for (idx, binding) in CPU_DOMAIN_BINDINGS.iter().enumerate() {
+        let is_ecpu = binding.channel_prefix != "PCPU";
+        if let Some(f) = cpu_freqs(item, binding.pmgr_key, is_ecpu, cpu_scale) {
+          cpu_freq_tables[idx] = f;
+        }
       }
 
       if let Some((_, freqs)) = get_dvfs_mhz(item, "voltage-states9") {
@@ -590,7 +628,9 @@ fn load_soc_info() -> WithError<SocInfo> {
     }
   }
 
-  if info.ecpu_freqs.is_empty() || info.pcpu_freqs.is_empty() {
+  info.cpu_domains = build_cpu_domains(cpu_domain_units, cpu_freq_tables);
+
+  if !info.cpu_domains.iter().any(|domain| !domain.freqs_mhz.is_empty()) {
     return Err("No CPU frequencies found".into());
   }
 
@@ -1077,30 +1117,54 @@ mod tests {
   }
 
   #[test]
-  fn parse_cpu_cores_macos26_4field() {
+  fn parse_cpu_domains_macos26_4field() {
     // Real data captured from macOS 26 machines
     // M5 Max: 18 total, 6 super, 0 efficiency, 12 performance(M-cores)
-    assert_eq!(parse_cpu_cores("proc 18:6:0:12"), (12, 6, true));
+    assert_eq!(parse_cpu_domain_units("proc 18:6:0:12"), vec![0, 6, 12]);
     // M4 Max: 16 total, 12 performance, 4 efficiency, 0 M-cores
-    assert_eq!(parse_cpu_cores("proc 16:12:4:0"), (4, 12, false));
+    assert_eq!(parse_cpu_domain_units("proc 16:12:4:0"), vec![4, 12, 0]);
     // M3 Air: 8 total, 4 performance, 4 efficiency, 0 M-cores
-    assert_eq!(parse_cpu_cores("proc 8:4:4:0"), (4, 4, false));
+    assert_eq!(parse_cpu_domain_units("proc 8:4:4:0"), vec![4, 4, 0]);
   }
 
   #[test]
-  fn parse_cpu_cores_macos15_3field() {
+  fn parse_cpu_domains_macos15_3field() {
     // Real data: M3 Air on macOS 15.6.1
-    assert_eq!(parse_cpu_cores("proc 8:4:4"), (4, 4, false));
+    assert_eq!(parse_cpu_domain_units("proc 8:4:4"), vec![4, 4, 0]);
   }
 
   #[test]
-  fn parse_cpu_cores_invalid() {
-    assert_eq!(parse_cpu_cores(""), (0, 0, false));
-    assert_eq!(parse_cpu_cores("garbage"), (0, 0, false));
-    assert_eq!(parse_cpu_cores("10:8:2"), (0, 0, false)); // missing "proc " prefix
-    assert_eq!(parse_cpu_cores("proc 8"), (0, 0, false)); // too few fields
-    assert_eq!(parse_cpu_cores("proc 8:4"), (0, 0, false)); // 2 fields, unsupported
-    assert_eq!(parse_cpu_cores("proc 24:6:0:12:6"), (0, 0, false)); // unknown future format
+  fn parse_cpu_domains_invalid() {
+    assert_eq!(parse_cpu_domain_units(""), vec![0, 0, 0]);
+    assert_eq!(parse_cpu_domain_units("garbage"), vec![0, 0, 0]);
+    assert_eq!(parse_cpu_domain_units("10:8:2"), vec![0, 0, 0]); // missing "proc " prefix
+    assert_eq!(parse_cpu_domain_units("proc 8"), vec![0, 0, 0]); // too few fields
+    assert_eq!(parse_cpu_domain_units("proc 8:4"), vec![0, 0, 0]); // 2 fields, unsupported
+    assert_eq!(parse_cpu_domain_units("proc 24:6:0:12:6"), vec![0, 0, 0]); // unknown future format
+  }
+
+  #[test]
+  fn build_cpu_domains_maps_units_by_binding_order() {
+    let domains =
+      build_cpu_domains(vec![0, 6, 12], vec![vec![1000], vec![3000, 4000], vec![1200, 2200]]);
+
+    assert_eq!(domains.len(), 2);
+    assert_eq!(domains[0].name, "PCPU");
+    assert_eq!(domains[0].units, 6);
+    assert_eq!(domains[0].freqs_mhz, vec![3000, 4000]);
+    assert_eq!(domains[1].name, "MCPU");
+    assert_eq!(domains[1].units, 12);
+    assert_eq!(domains[1].freqs_mhz, vec![1200, 2200]);
+  }
+
+  #[test]
+  fn build_cpu_domains_drops_zero_unit_domains() {
+    let domains = build_cpu_domains(vec![0, 0, 12], vec![vec![1000], vec![3000], vec![1000, 2000]]);
+
+    assert_eq!(domains.len(), 1);
+    assert_eq!(domains[0].name, "MCPU");
+    assert_eq!(domains[0].units, 12);
+    assert_eq!(domains[0].freqs_mhz, vec![1000, 2000]);
   }
 
   #[test]

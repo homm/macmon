@@ -1,0 +1,41 @@
+[package]
+name = "macmon-lib"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+autobenches = false
+description = "Sudoless performance monitoring library for Apple Silicon processors"
+keywords = ["macos", "apple-silicon", "monitoring", "ffi"]
+categories = ["hardware-support", "api-bindings"]
+
+[package.metadata.docs.rs]
+targets = ["aarch64-apple-darwin"]
+
+[features]
+bench = []
+
+[lib]
+name = "macmon"
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+core-foundation.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+divan = "0.1.21"
+
+[[bench]]
+name = "bench"
+harness = false
+required-features = ["bench"]

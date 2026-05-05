@@ -24,7 +24,7 @@ jobs:
 
       - run: rustup update --no-self-update stable && rustup default stable
       - run: cargo fmt --check
-      - run: cargo build --release --locked
+      - run: make xcframework
 
       - name: Check Cargo.toml version matches tag
         run: |
@@ -35,14 +35,10 @@ jobs:
             exit 1
           fi
 
-      - name: Check binary version matches tag
-        run: ./target/release/macmon -V | grep "${GITHUB_REF_NAME#v}" || exit 1
-
       - name: Archiving
         run: |
-          cp target/release/macmon macmon
-          tar czf macmon-${{ github.ref_name }}.tar.gz readme.md LICENSE macmon
-          ls -lah | grep macmon
+          ditto -c -k --sequesterRsrc --keepParent dist/CMacmon.xcframework CMacmon.xcframework-${{ github.ref_name }}.zip
+          ls -lah CMacmon.xcframework-${{ github.ref_name }}.zip
 
       - name: Extract changelog entry
         run: |
@@ -57,17 +53,7 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           body_path: release_notes.txt
-          files: macmon-${{ github.ref_name }}.tar.gz
+          files: |
+            CMacmon.xcframework-${{ github.ref_name }}.zip
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: mislav/bump-homebrew-formula-action@v3
-        with:
-          homebrew-tap: vladkens/homebrew-tap
-          formula-name: macmon
-          formula-path: macmon.rb
-          commit-message: "{{formulaName}} {{version}}"
-          download-url: https://github.com/vladkens/macmon/releases/download/${{ github.ref_name }}/macmon-${{ github.ref_name }}.tar.gz
-        env:
-          COMMITTER_TOKEN: ${{ secrets.HOMEBREW_REPO_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

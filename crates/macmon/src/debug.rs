@@ -2,8 +2,8 @@ use core_foundation::base::{CFRelease, CFShow};
 use std::{thread, time::Duration};
 
 use crate::config::INTERVAL_INIT_SAMPLE;
-use crate::metrics::ioreport_channels_filter;
-use crate::sources::{
+use macmon_lib::metrics::ioreport_channels_filter;
+use macmon_lib::sources::{
   IOHIDSensors, IOReport, IOServiceIterator, SMC, cfdict_keys, cfio_get_props,
   cfio_get_residencies, cfio_integer_value, get_dvfs_mhz, run_system_profiler,
 };
