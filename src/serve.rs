@@ -14,27 +14,36 @@ fn to_prometheus(m: &Metrics, soc: &SocInfo) -> String {
 
   macro_rules! gauge {
     ($out:expr, $name:literal, $help:literal, $value:expr) => {
+      gauge_labels!($out, $name, $help, &l, $value);
+    };
+  }
+
+  macro_rules! gauge_labels {
+    ($out:expr, $name:literal, $help:literal, $labels:expr, $value:expr) => {
       $out.push_str(&format!(
         "# HELP {} {}\n# TYPE {} gauge\n{}{{{l}}} {}\n\n",
-        $name, $help, $name, $name, $value
+        $name, $help, $name, $name, $value, l = $labels
       ));
     };
   }
 
   let mut out = String::new();
-  gauge!(out, "macmon_cpu_temp_celsius", "Average CPU temperature in Celsius", m.temp.cpu_temp_avg);
-  gauge!(out, "macmon_gpu_temp_celsius", "Average GPU temperature in Celsius", m.temp.gpu_temp_avg);
+  gauge!(out, "macmon_cpu_temp_celsius", "Average CPU temperature in Celsius", m.temp.cpu_avg);
+  gauge!(out, "macmon_gpu_temp_celsius", "Average GPU temperature in Celsius", m.temp.gpu_avg);
   gauge!(out, "macmon_memory_ram_total_bytes", "Total RAM in bytes", m.memory.ram_total);
   gauge!(out, "macmon_memory_ram_used_bytes", "Used RAM in bytes", m.memory.ram_usage);
   gauge!(out, "macmon_memory_swap_total_bytes", "Total swap in bytes", m.memory.swap_total);
   gauge!(out, "macmon_memory_swap_used_bytes", "Used swap in bytes", m.memory.swap_usage);
-  gauge!(out, "macmon_cpu_usage_ratio", "Combined CPU utilization (0–1), weighted by core count", m.cpu_usage_pct);
-  gauge!(out, "macmon_ecpu_freq_mhz", "Efficiency CPU cluster frequency in MHz", m.ecpu_usage.0);
-  gauge!(out, "macmon_ecpu_usage_ratio", "Efficiency CPU cluster utilization (0–1)", m.ecpu_usage.1);
-  gauge!(out, "macmon_pcpu_freq_mhz", "Performance CPU cluster frequency in MHz", m.pcpu_usage.0);
-  gauge!(out, "macmon_pcpu_usage_ratio", "Performance CPU cluster utilization (0–1)", m.pcpu_usage.1);
-  gauge!(out, "macmon_gpu_freq_mhz", "GPU frequency in MHz", m.gpu_usage.0);
-  gauge!(out, "macmon_gpu_usage_ratio", "GPU utilization (0–1)", m.gpu_usage.1);
+  for domain in &m.cpu_usage {
+    let labels = format!(r#"chip="{chip}",domain="{}""#, domain.name);
+    gauge_labels!(out, "macmon_cpu_usage_freq_mhz", "CPU domain frequency in MHz", &labels, domain.freq_mhz);
+    gauge_labels!(out, "macmon_cpu_usage_ratio", "CPU domain utilization (0–1)", &labels, domain.usage);
+  }
+  for domain in &m.gpu_usage {
+    let labels = format!(r#"chip="{chip}",domain="{}""#, domain.name);
+    gauge_labels!(out, "macmon_gpu_usage_freq_mhz", "GPU domain frequency in MHz", &labels, domain.freq_mhz);
+    gauge_labels!(out, "macmon_gpu_usage_ratio", "GPU domain utilization (0–1)", &labels, domain.usage);
+  }
   gauge!(out, "macmon_power_package_watts", "SoC/package power consumption in Watts", m.power.package);
   gauge!(out, "macmon_power_cpu_watts", "CPU power consumption in Watts", m.power.cpu);
   gauge!(out, "macmon_power_gpu_watts", "GPU power consumption in Watts", m.power.gpu);

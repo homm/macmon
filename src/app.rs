@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use std::{io::stdout, time::Instant};
 use std::{sync::mpsc, time::Duration};
@@ -49,15 +50,17 @@ struct FreqStore {
   items: Vec<u64>, // from 0 to 100
   top_value: u64,
   usage: f64, // from 0.0 to 1.0
+  units: u32,
 }
 
 impl FreqStore {
-  fn push(&mut self, value: u64, usage: f64) {
+  fn push(&mut self, value: u64, usage: f64, units: u32) {
     self.items.insert(0, (usage * 100.0) as u64);
     self.items.truncate(MAX_SPARKLINE);
 
     self.top_value = value;
     self.usage = usage;
+    self.units = units;
   }
 }
 
@@ -261,8 +264,7 @@ pub struct App {
   cpu_temp: TempStore,
   gpu_temp: TempStore,
 
-  ecpu_freq: FreqStore,
-  pcpu_freq: FreqStore,
+  cpu_freqs: BTreeMap<String, FreqStore>,
   igpu_freq: FreqStore,
 }
 
@@ -279,12 +281,20 @@ impl App {
     self.ane_power.push(data.power.ane as f64);
     self.package_power.push(data.power.package as f64);
     self.board_power.push(data.power.board as f64);
-    self.ecpu_freq.push(data.ecpu_usage.0 as u64, data.ecpu_usage.1 as f64);
-    self.pcpu_freq.push(data.pcpu_usage.0 as u64, data.pcpu_usage.1 as f64);
-    self.igpu_freq.push(data.gpu_usage.0 as u64, data.gpu_usage.1 as f64);
+    self.cpu_freqs.retain(|name, _| data.cpu_usage.iter().any(|entry| entry.name == *name));
+    for entry in &data.cpu_usage {
+      self.cpu_freqs.entry(entry.name.clone()).or_default().push(
+        entry.freq_mhz as u64,
+        entry.usage as f64,
+        entry.units,
+      );
+    }
+    if let Some(entry) = data.gpu_usage.first() {
+      self.igpu_freq.push(entry.freq_mhz as u64, entry.usage as f64, entry.units);
+    }
 
-    self.cpu_temp.push(data.temp.cpu_temp_avg);
-    self.gpu_temp.push(data.temp.gpu_temp_avg);
+    self.cpu_temp.push(data.temp.cpu_avg);
+    self.gpu_temp.push(data.temp.gpu_avg);
 
     self.mem.push(data.memory);
   }
@@ -356,6 +366,31 @@ impl App {
     }
   }
 
+  fn render_freq_row(
+    &self,
+    f: &mut Frame,
+    r: Rect,
+    items: Vec<(&str, &FreqStore)>,
+    empty_label: &str,
+  ) {
+    if items.is_empty() {
+      let block = self.title_block(empty_label, "");
+      f.render_widget(block, r);
+      return;
+    }
+
+    let constraints = vec![Constraint::Fill(1); items.len()];
+    let areas =
+      Layout::default().direction(Direction::Horizontal).constraints(constraints).split(r);
+    for (idx, (name, store)) in items.iter().enumerate() {
+      let label = match store.units > 0 {
+        true => format!("{name}({})", store.units),
+        false => name.to_string(),
+      };
+      self.render_freq_block(f, areas[idx], &label, store);
+    }
+  }
+
   fn render_mem_block(&self, f: &mut Frame, r: Rect, val: &MemoryStore) {
     let ram_usage_gb = val.ram_usage as f64 / GB as f64;
     let ram_total_gb = val.ram_total as f64 / GB as f64;
@@ -392,16 +427,21 @@ impl App {
   }
 
   fn render(&mut self, f: &mut Frame) {
-    let label_l = format!(
-      "{} ({}{}+{}{}+{}GPU {}GB)",
-      self.soc.chip_name,
-      self.soc.ecpu_cores,
-      self.soc.ecpu_label,
-      self.soc.pcpu_cores,
-      self.soc.pcpu_label,
-      self.soc.gpu_cores,
-      self.soc.memory_gb,
-    );
+    let cpu_layout = self
+      .soc
+      .cpu_domains
+      .iter()
+      .map(|domain| domain.units.to_string())
+      .collect::<Vec<_>>()
+      .join("+");
+    let label_l = if cpu_layout.is_empty() {
+      format!("{} ({} GPU, {}GB)", self.soc.chip_name, self.soc.gpu_cores, self.soc.memory_gb)
+    } else {
+      format!(
+        "{} ({} CPU, {} GPU, {}GB)",
+        self.soc.chip_name, cpu_layout, self.soc.gpu_cores, self.soc.memory_gb,
+      )
+    };
 
     let rows = Layout::default()
       .direction(Direction::Vertical)
@@ -419,11 +459,9 @@ impl App {
       .split(iarea);
 
     // 1st row
-    let (c1, c2) = h_stack(iarea[0]);
-    let ecpu_block_label = format!("{}-CPU", self.soc.ecpu_label);
-    let pcpu_block_label = format!("{}-CPU", self.soc.pcpu_label);
-    self.render_freq_block(f, c1, &ecpu_block_label, &self.ecpu_freq);
-    self.render_freq_block(f, c2, &pcpu_block_label, &self.pcpu_freq);
+    let cpu_items =
+      self.cpu_freqs.iter().map(|(name, store)| (name.as_str(), store)).collect::<Vec<_>>();
+    self.render_freq_row(f, iarea[0], cpu_items, "CPU");
 
     // 2nd row
     let (c1, c2) = h_stack(iarea[1]);

@@ -2,7 +2,8 @@ use core_foundation::dictionary::CFDictionaryRef;
 use serde::Serialize;
 
 use crate::sources::{
-  IOHIDSensors, IOReport, SMC, SocInfo, cfio_get_residencies, get_soc_info, libc_ram, libc_swap,
+  CpuDomainInfo, IOHIDSensors, IOReport, SMC, SocInfo, cfio_get_residencies, get_soc_info,
+  libc_ram, libc_swap,
 };
 
 type WithError<T> = Result<T, Box<dyn std::error::Error>>;
@@ -15,8 +16,8 @@ const GPU_FREQ_DICE_SUBG: &str = "GPU Performance States";
 
 #[derive(Debug, Default, Serialize)]
 pub struct TempMetrics {
-  pub cpu_temp_avg: f32, // Celsius
-  pub gpu_temp_avg: f32, // Celsius
+  pub cpu_avg: f32, // Celsius
+  pub gpu_avg: f32, // Celsius
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -40,14 +41,35 @@ pub struct PowerMetrics {
   pub dc_in: f32,   // External DC input power (`PDTR`).
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct CoreUsageEntry {
+  pub freq_mhz: u32,
+  pub usage: f32,
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct CpuUsageEntry {
+  pub name: String,
+  pub units: u32,
+  pub freq_mhz: u32,
+  pub usage: f32,
+  pub cores: Vec<CoreUsageEntry>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct GpuUsageEntry {
+  pub name: String,
+  pub units: u32,
+  pub freq_mhz: u32,
+  pub usage: f32,
+}
+
+#[derive(Debug, Default)]
 pub struct Metrics {
   pub temp: TempMetrics,
   pub memory: MemMetrics,
-  pub ecpu_usage: (u32, f32), // freq MHz, usage ratio
-  pub pcpu_usage: (u32, f32), // freq MHz, usage ratio
-  pub cpu_usage_pct: f32,     // combined ecpu+pcpu usage, weighted by core count
-  pub gpu_usage: (u32, f32),  // freq MHz, usage ratio
+  pub cpu_usage: Vec<CpuUsageEntry>,
+  pub gpu_usage: Vec<GpuUsageEntry>,
   pub power: PowerMetrics,
 }
 
@@ -96,17 +118,21 @@ fn calc_freq(item: CFDictionaryRef, freqs: &[u32]) -> (u32, f32) {
   calc_freq_from_residencies(&items, freqs)
 }
 
-fn calc_cluster_usage_at_peak_freq(items: &[(u32, f32)]) -> (u32, f32) {
-  let peak_freq = items.iter().filter(|x| x.1 > 0.0).map(|x| x.0).max().unwrap_or(0);
+fn calc_cluster_usage_at_peak_freq(cores: &[CoreUsageEntry]) -> (u32, f32) {
+  let peak_freq = cores.iter().filter(|x| x.usage > 0.0).map(|x| x.freq_mhz).max().unwrap_or(0);
   if peak_freq == 0 {
     return (0, 0.0);
   }
 
   let peak_freq = peak_freq as f32;
   let usage =
-    zero_div(items.iter().map(|x| x.1 * x.0 as f32 / peak_freq).sum(), items.len() as f32);
+    zero_div(cores.iter().map(|x| x.usage * x.freq_mhz as f32 / peak_freq).sum(), cores.len() as f32);
 
   (peak_freq as u32, usage)
+}
+
+fn cpu_channel_domain_index(channel: &str, domains: &[CpuDomainInfo]) -> Option<usize> {
+  domains.iter().position(|domain| channel.contains(domain.name.as_str()))
 }
 
 pub(crate) fn init_smc() -> WithError<(SMC, Vec<String>, Vec<String>)> {
@@ -201,10 +227,10 @@ impl Sampler {
       }
     }
 
-    let cpu_temp_avg = zero_div(cpu_metrics.iter().sum::<f32>(), cpu_metrics.len() as f32);
-    let gpu_temp_avg = zero_div(gpu_metrics.iter().sum::<f32>(), gpu_metrics.len() as f32);
+    let cpu_avg = zero_div(cpu_metrics.iter().sum::<f32>(), cpu_metrics.len() as f32);
+    let gpu_avg = zero_div(gpu_metrics.iter().sum::<f32>(), gpu_metrics.len() as f32);
 
-    Ok(TempMetrics { cpu_temp_avg, gpu_temp_avg })
+    Ok(TempMetrics { cpu_avg, gpu_avg })
   }
 
   fn get_temp_hid(&mut self) -> WithError<TempMetrics> {
@@ -231,10 +257,10 @@ impl Sampler {
       }
     }
 
-    let cpu_temp_avg = zero_div(cpu_values.iter().sum(), cpu_values.len() as f32);
-    let gpu_temp_avg = zero_div(gpu_values.iter().sum(), gpu_values.len() as f32);
+    let cpu_avg = zero_div(cpu_values.iter().sum(), cpu_values.len() as f32);
+    let gpu_avg = zero_div(gpu_values.iter().sum(), gpu_values.len() as f32);
 
-    Ok(TempMetrics { cpu_temp_avg, gpu_temp_avg })
+    Ok(TempMetrics { cpu_avg, gpu_avg })
   }
 
   fn get_temp(&mut self) -> WithError<TempMetrics> {
@@ -266,27 +292,32 @@ impl Sampler {
     //           (e.g. "DIE_0_ECPU0"), so use contains() not starts_with() — same
     //           pattern as Energy Model's "DIE_{}_CPU Energy".
 
-    let mut ecpu_usages = Vec::new();
-    let mut pcpu_usages = Vec::new();
+    let cpu_domains = self.soc.cpu_domains.clone();
+    let mut cpu_domain_cores = vec![Vec::new(); cpu_domains.len()];
     let mut rs = Metrics::default();
 
     for x in self.ior.get_sample() {
       // Keep this channel handling in sync with ioreport_channels_filter.
       if x.group == "CPU Stats" && x.subgroup == CPU_FREQ_CORE_SUBG {
-        if x.channel.contains("PCPU") {
-          pcpu_usages.push(calc_freq(x.item, &self.soc.pcpu_freqs));
-          continue;
-        }
-
-        if x.channel.contains("ECPU") || x.channel.contains("MCPU") {
-          ecpu_usages.push(calc_freq(x.item, &self.soc.ecpu_freqs));
+        if let Some(domain_idx) = cpu_channel_domain_index(&x.channel, &cpu_domains) {
+          let domain = &cpu_domains[domain_idx];
+          let (freq_mhz, usage) = calc_freq(x.item, &domain.freqs_mhz);
+          cpu_domain_cores[domain_idx].push(CoreUsageEntry { freq_mhz, usage });
           continue;
         }
       }
 
       if x.group == "GPU Stats" && x.subgroup == GPU_FREQ_DICE_SUBG {
         match x.channel.as_str() {
-          "GPUPH" => rs.gpu_usage = calc_freq(x.item, &self.soc.gpu_freqs[1..]),
+          "GPUPH" => {
+            let (freq_mhz, usage) = calc_freq(x.item, &self.soc.gpu_freqs[1..]);
+            rs.gpu_usage.push(GpuUsageEntry {
+              name: x.channel.clone(),
+              units: self.soc.gpu_cores as u32,
+              freq_mhz,
+              usage,
+            });
+          }
           _ => {}
         }
       }
@@ -305,16 +336,22 @@ impl Sampler {
       }
     }
 
-    // Filter dead/disabled cores (e.g. M5 Max MCPU0 cluster is all-DOWN)
-    ecpu_usages.retain(|&(_, pct)| pct > 0.0);
-    rs.ecpu_usage = calc_cluster_usage_at_peak_freq(&ecpu_usages);
-    rs.pcpu_usage = calc_cluster_usage_at_peak_freq(&pcpu_usages);
+    for (domain_idx, domain) in cpu_domains.iter().enumerate() {
+      let cores = &cpu_domain_cores[domain_idx];
+      if cores.is_empty() {
+        continue;
+      }
 
-    let ecores = self.soc.ecpu_cores as f32;
-    let pcores = self.soc.pcpu_cores as f32;
-    let tcores = ecores + pcores;
+      let (freq_mhz, usage) = calc_cluster_usage_at_peak_freq(cores);
+      rs.cpu_usage.push(CpuUsageEntry {
+        name: domain.name.clone(),
+        units: domain.units,
+        freq_mhz,
+        usage,
+        cores: cores.clone(),
+      });
+    }
 
-    rs.cpu_usage_pct = zero_div(rs.ecpu_usage.1 * ecores + rs.pcpu_usage.1 * pcores, tcores);
     rs.power.package = rs.power.cpu + rs.power.gpu + rs.power.ane + rs.power.ram + rs.power.gpu_ram;
 
     rs.memory = self.get_mem()?;
@@ -330,7 +367,11 @@ impl Sampler {
 
 #[cfg(test)]
 mod tests {
-  use super::{calc_cluster_usage_at_peak_freq, calc_freq_from_residencies};
+  use super::{
+    CoreUsageEntry, calc_cluster_usage_at_peak_freq, calc_freq_from_residencies,
+    cpu_channel_domain_index,
+  };
+  use crate::sources::CpuDomainInfo;
 
   #[test]
   fn calc_freq_returns_raw_usage_ratio() {
@@ -371,7 +412,11 @@ mod tests {
 
   #[test]
   fn calc_cluster_usage_at_peak_freq_preserves_idle_frequency() {
-    let (freq, usage) = calc_cluster_usage_at_peak_freq(&[(0, 0.0), (0, 0.0)]);
+    let cores = [
+      CoreUsageEntry { freq_mhz: 0, usage: 0.0 },
+      CoreUsageEntry { freq_mhz: 0, usage: 0.0 },
+    ];
+    let (freq, usage) = calc_cluster_usage_at_peak_freq(&cores);
 
     assert_eq!(freq, 0);
     assert_eq!(usage, 0.0);
@@ -380,16 +425,16 @@ mod tests {
   #[test]
   fn calc_cluster_usage_at_peak_freq_scales_usage_to_peak_frequency() {
     let items = [
-      (4500, 1.0),
-      (1000, 0.3),
-      (0, 0.0),
-      (0, 0.0),
-      (0, 0.0),
-      (0, 0.0),
-      (0, 0.0),
-      (0, 0.0),
-      (0, 0.0),
-      (0, 0.0),
+      CoreUsageEntry { freq_mhz: 4500, usage: 1.0 },
+      CoreUsageEntry { freq_mhz: 1000, usage: 0.3 },
+      CoreUsageEntry { freq_mhz: 0, usage: 0.0 },
+      CoreUsageEntry { freq_mhz: 0, usage: 0.0 },
+      CoreUsageEntry { freq_mhz: 0, usage: 0.0 },
+      CoreUsageEntry { freq_mhz: 0, usage: 0.0 },
+      CoreUsageEntry { freq_mhz: 0, usage: 0.0 },
+      CoreUsageEntry { freq_mhz: 0, usage: 0.0 },
+      CoreUsageEntry { freq_mhz: 0, usage: 0.0 },
+      CoreUsageEntry { freq_mhz: 0, usage: 0.0 },
     ];
     let (freq, usage) = calc_cluster_usage_at_peak_freq(&items);
 
@@ -402,25 +447,24 @@ mod tests {
     // On Ultra chips (M1/M2/M3 Ultra) IOReport CPU Stats channels are prefixed "DIE_N_".
     // These should be recognised; they were with contains() in v0.6.1 but broke when
     // ff5f058 changed to starts_with().
+    let domains = vec![
+      CpuDomainInfo { name: "ECPU".into(), units: 4, freqs_mhz: vec![1000] },
+      CpuDomainInfo { name: "PCPU".into(), units: 8, freqs_mhz: vec![2000] },
+      CpuDomainInfo { name: "MCPU".into(), units: 12, freqs_mhz: vec![1500] },
+    ];
     let cases = [
-      ("DIE_0_ECPU0", "ecpu"),
-      ("DIE_1_ECPU0", "ecpu"),
-      ("DIE_0_PCPU0", "pcpu"),
-      ("DIE_1_PCPU0", "pcpu"),
+      ("DIE_0_ECPU0", "ECPU"),
+      ("DIE_1_ECPU0", "ECPU"),
+      ("DIE_0_PCPU0", "PCPU"),
+      ("DIE_1_PCPU0", "PCPU"),
       // Standard (non-Ultra) channels must still work
-      ("ECPU0", "ecpu"),
-      ("PCPU0", "pcpu"),
-      ("MCPU0", "ecpu"), // M5+ performance cores map to ecpu slot
+      ("ECPU0", "ECPU"),
+      ("PCPU0", "PCPU"),
+      ("MCPU0", "MCPU"),
     ];
     for (ch, expected) in cases {
-      let matched = if ch.contains("PCPU") {
-        "pcpu"
-      } else if ch.contains("ECPU") || ch.contains("MCPU") {
-        "ecpu"
-      } else {
-        "none"
-      };
-      assert_eq!(matched, expected, "channel {ch}");
+      let matched = cpu_channel_domain_index(ch, &domains).map(|idx| domains[idx].name.as_str());
+      assert_eq!(matched, Some(expected), "channel {ch}");
     }
   }
 }

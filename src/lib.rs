@@ -7,6 +7,7 @@ pub mod app;
 pub mod config;
 pub mod debug;
 pub mod metrics;
+mod metrics_json;
 pub mod sources;
 
 #[cfg(feature = "bench")]
@@ -26,5 +27,8 @@ pub mod bench {
 // Re-export commonly used types
 pub use app::App;
 pub use config::{Config, ViewType};
-pub use metrics::{MemMetrics, Metrics, PowerMetrics, Sampler, TempMetrics, zero_div};
-pub use sources::{SocInfo, get_soc_info};
+pub use metrics::{
+  CoreUsageEntry, CpuUsageEntry, GpuUsageEntry, MemMetrics, Metrics, PowerMetrics, Sampler,
+  TempMetrics, zero_div,
+};
+pub use sources::{CpuDomainInfo, SocInfo, get_soc_info};

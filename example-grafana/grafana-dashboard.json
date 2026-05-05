@@ -80,7 +80,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "macmon_all_power_watts",
+          "expr": "macmon_power_package_watts",
           "legendFormat": "",
           "range": true,
           "refId": "A"
@@ -361,35 +361,35 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "macmon_cpu_power_watts",
+          "expr": "macmon_power_cpu_watts",
           "legendFormat": "CPU",
           "range": true,
           "refId": "A"
         },
         {
           "editorMode": "code",
-          "expr": "macmon_gpu_power_watts",
+          "expr": "macmon_power_gpu_watts",
           "legendFormat": "GPU",
           "range": true,
           "refId": "B"
         },
         {
           "editorMode": "code",
-          "expr": "macmon_ane_power_watts",
+          "expr": "macmon_power_ane_watts",
           "legendFormat": "ANE",
           "range": true,
           "refId": "C"
         },
         {
           "editorMode": "code",
-          "expr": "macmon_ram_power_watts",
+          "expr": "macmon_power_ram_watts",
           "legendFormat": "RAM",
           "range": true,
           "refId": "D"
         },
         {
           "editorMode": "code",
-          "expr": "macmon_sys_power_watts",
+          "expr": "macmon_power_board_watts",
           "legendFormat": "System",
           "range": true,
           "refId": "E"
@@ -480,14 +480,14 @@
         },
         {
           "editorMode": "code",
-          "expr": "macmon_ecpu_usage_ratio",
+          "expr": "macmon_cpu_usage_ratio{domain=\"ECPU\"}",
           "legendFormat": "E-cores",
           "range": true,
           "refId": "B"
         },
         {
           "editorMode": "code",
-          "expr": "macmon_pcpu_usage_ratio",
+          "expr": "macmon_cpu_usage_ratio{domain=\"PCPU\"}",
           "legendFormat": "P-cores",
           "range": true,
           "refId": "C"
@@ -754,21 +754,21 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "macmon_ecpu_freq_mhz",
+          "expr": "macmon_cpu_usage_freq_mhz{domain=\"ECPU\"}",
           "legendFormat": "E-core freq",
           "range": true,
           "refId": "A"
         },
         {
           "editorMode": "code",
-          "expr": "macmon_pcpu_freq_mhz",
+          "expr": "macmon_cpu_usage_freq_mhz{domain=\"PCPU\"}",
           "legendFormat": "P-core freq",
           "range": true,
           "refId": "B"
         },
         {
           "editorMode": "code",
-          "expr": "macmon_gpu_freq_mhz",
+          "expr": "macmon_gpu_usage_freq_mhz",
           "legendFormat": "GPU freq",
           "range": true,
           "refId": "C"
