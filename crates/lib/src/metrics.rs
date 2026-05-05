@@ -146,10 +146,8 @@ pub(crate) fn init_smc() -> WithError<(SMC, Vec<String>, Vec<String>)> {
   let names = smc.read_all_keys().unwrap_or(vec![]);
   for name in &names {
     // Unfortunately, it is not known which keys are responsible for what.
-    // Basically in the code that can be found publicly "Tp" is used for CPU and "Tg" for GPU.
-
-    let is_cpu = name.starts_with("Tp") || name.starts_with("Te") || name.starts_with("Ts");
-    let is_gpu = name.starts_with("Tg");
+    let is_cpu = name.starts_with("Tp0") || name.starts_with("Tp1");
+    let is_gpu = name.starts_with("Tg0");
     if !is_cpu && !is_gpu {
       continue;
     }
