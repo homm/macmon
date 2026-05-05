@@ -3,6 +3,7 @@
 //! This library provides access to hardware metrics from Apple Silicon processors,
 //! including CPU/GPU frequencies, power consumption, temperatures, and memory usage.
 
+pub mod ffi;
 pub mod metrics;
 mod metrics_json;
 pub mod sources;

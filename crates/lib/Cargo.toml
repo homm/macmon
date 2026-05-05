@@ -10,8 +10,8 @@ documentation.workspace = true
 readme.workspace = true
 autobenches = false
 description = "Sudoless performance monitoring library for Apple Silicon processors"
-keywords = ["macos", "apple-silicon", "monitoring"]
-categories = ["hardware-support"]
+keywords = ["macos", "apple-silicon", "monitoring", "ffi"]
+categories = ["hardware-support", "api-bindings"]
 
 [package.metadata.docs.rs]
 targets = ["aarch64-apple-darwin"]
@@ -21,6 +21,7 @@ bench = []
 
 [lib]
 name = "macmon"
+crate-type = ["cdylib", "rlib"]
 
 [lints]
 workspace = true
