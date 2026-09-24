@@ -23,7 +23,9 @@ use core_foundation::{
     CFDictionaryGetKeysAndValues, CFDictionaryGetValue, CFDictionaryRef, CFDictionarySetValue,
     CFMutableDictionaryRef, kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks,
   },
-  number::{CFNumberCreate, CFNumberRef, kCFNumberSInt32Type},
+  number::{
+    CFNumberCreate, CFNumberGetValue, CFNumberRef, kCFNumberSInt32Type, kCFNumberSInt64Type,
+  },
   string::{CFStringCreateWithBytesNoCopy, CFStringGetCString, CFStringRef, kCFStringEncodingUTF8},
 };
 use serde::Serialize;
@@ -289,12 +291,12 @@ pub struct IOReportIteratorItem {
 
 impl IOReportIteratorItem {
   pub fn watts(&self) -> WithError<f32> {
-    let val = unsafe { IOReportSimpleGetIntegerValue(self.item, 0) } as f32;
-    let val = val / self.duration.as_secs_f32();
+    let val = unsafe { IOReportSimpleGetIntegerValue(self.item, 0) } as f64;
+    let val = val / self.duration.as_secs_f64();
     match self.unit.as_str() {
-      "mJ" => Ok(val / 1e3f32),
-      "uJ" => Ok(val / 1e6f32),
-      "nJ" => Ok(val / 1e9f32),
+      "mJ" => Ok((val / 1e3) as f32),
+      "uJ" => Ok((val / 1e6) as f32),
+      "nJ" => Ok((val / 1e9) as f32),
       _ => Err(format!("Invalid energy unit: {}", self.unit).into()),
     }
   }
@@ -468,6 +470,21 @@ fn parse_acc_clusters(data: &[u8]) -> Option<(String, String)> {
   Some((ecpu_key, pcpu_key))
 }
 
+fn acc_cluster_key(data: &[u8], tier: u8) -> Option<String> {
+  data
+    .chunks_exact(8)
+    .find(|entry| entry[1] == tier)
+    .map(|entry| format!("voltage-states{}-sram", entry[0]))
+}
+
+fn acc_cluster_key_from(dict: CFDictionaryRef, tier: u8) -> Option<String> {
+  let obj = cfdict_get_val(dict, "acc-clusters")? as CFDataRef;
+  let len = unsafe { CFDataGetLength(obj) } as usize;
+  let mut data = vec![0; len];
+  unsafe { CFDataGetBytes(obj, CFRange::init(0, len as _), data.as_mut_ptr()) };
+  acc_cluster_key(&data, tier)
+}
+
 // Read acc-clusters from pmgr dict and parse into (ecpu_key, pcpu_key).
 fn parse_acc_clusters_from(dict: CFDictionaryRef) -> Option<(String, String)> {
   let obj = cfdict_get_val(dict, "acc-clusters")? as CFDataRef;
@@ -508,7 +525,18 @@ fn cpu_freq_scale(chip_name: &str) -> u32 {
 }
 
 // Try known voltage-states key (M1-M4) first, fall back to acc-clusters discovery (M5+).
-fn cpu_freqs(item: CFDictionaryRef, key: &str, is_ecpu: bool, scale: u32) -> Option<Vec<u32>> {
+fn cpu_freqs(
+  item: CFDictionaryRef,
+  key: &str,
+  is_ecpu: bool,
+  scale: u32,
+  tier: Option<u8>,
+) -> Option<Vec<u32>> {
+  if let Some(key) = tier.and_then(|tier| acc_cluster_key_from(item, tier))
+    && let Some((_, freqs)) = get_dvfs_mhz(item, &key)
+  {
+    return Some(to_mhz(freqs, scale));
+  }
   if let Some((_, freqs)) = get_dvfs_mhz(item, key) {
     return Some(to_mhz(freqs, scale));
   }
@@ -549,6 +577,92 @@ fn parse_cpu_domain_units(s: &str) -> Vec<u64> {
   units
 }
 
+fn sysctl_value<T: Copy + Default>(name: &str) -> Option<T> {
+  let name = std::ffi::CString::new(name).ok()?;
+  let mut value = T::default();
+  let mut len = size_of::<T>();
+  let status = unsafe {
+    libc::sysctlbyname(
+      name.as_ptr(),
+      (&mut value as *mut T).cast(),
+      &mut len,
+      std::ptr::null_mut(),
+      0,
+    )
+  };
+  (status == 0 && len == size_of::<T>()).then_some(value)
+}
+
+fn sysctl_string(name: &str) -> Option<String> {
+  let name = std::ffi::CString::new(name).ok()?;
+  let mut len = 0;
+  if unsafe {
+    libc::sysctlbyname(name.as_ptr(), std::ptr::null_mut(), &mut len, std::ptr::null_mut(), 0)
+  } != 0
+  {
+    return None;
+  }
+  let mut bytes = vec![0u8; len];
+  if unsafe {
+    libc::sysctlbyname(name.as_ptr(), bytes.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0)
+  } != 0
+  {
+    return None;
+  }
+  bytes.truncate(len);
+  String::from_utf8(bytes).ok().map(|s| s.trim_end_matches('\0').to_string())
+}
+
+fn cpu_domain_units_native() -> Option<Vec<u64>> {
+  let levels = sysctl_value::<u32>("hw.nperflevels")?;
+  if levels == 0 || levels > 3 {
+    return None;
+  }
+  let tiers: Vec<_> = (0..levels)
+    .map(|level| {
+      Some((
+        sysctl_string(&format!("hw.perflevel{level}.name"))?,
+        sysctl_value::<u32>(&format!("hw.perflevel{level}.physicalcpu"))? as u64,
+      ))
+    })
+    .collect::<Option<_>>()?;
+  cpu_domain_units_from_tiers(&tiers)
+}
+
+fn cpu_domain_units_from_tiers(tiers: &[(String, u64)]) -> Option<Vec<u64>> {
+  let has_super = tiers.iter().any(|(name, _)| name == "Super");
+  let mut units = vec![0; CPU_DOMAIN_BINDINGS.len()];
+  for (name, count) in tiers {
+    let channel = match name.as_str() {
+      "Efficiency" => "ECPU",
+      "Performance" if has_super => "MCPU",
+      "Performance" => "PCPU",
+      "Super" => "PCPU",
+      _ => return None,
+    };
+    set_cpu_domain_units(&mut units, channel, *count);
+  }
+  Some(units)
+}
+
+fn gpu_cores_native() -> Option<u64> {
+  for (entry, name) in IOServiceIterator::new("AGXAccelerator").ok()? {
+    let Ok(item) = cfio_get_props(entry, name) else { continue };
+    let value = cfdict_get_val(item, "gpu-core-count").and_then(|obj| {
+      let mut count = 0i64;
+      let ok = unsafe {
+        CFNumberGetValue(obj as CFNumberRef, kCFNumberSInt64Type, (&mut count as *mut i64).cast())
+      };
+      ok.then_some(count)
+    });
+    unsafe { CFRelease(item as _) };
+    if let Some(count) = value.filter(|count| *count > 0) {
+      return Some(count as u64);
+    }
+  }
+  None
+}
+
 fn build_cpu_domains(domain_units: Vec<u64>, freq_tables: Vec<Vec<u32>>) -> Vec<CpuDomainInfo> {
   CPU_DOMAIN_BINDINGS
     .iter()
@@ -574,29 +688,34 @@ pub fn get_soc_info() -> WithError<SocInfo> {
 }
 
 fn load_soc_info() -> WithError<SocInfo> {
-  let out = run_system_profiler()?;
   let mut info = SocInfo::default();
-
-  // SPHardwareDataType.0.chip_type
-  let chip_name = out["SPHardwareDataType"][0]["chip_type"].as_str();
-  let chip_name = chip_name.unwrap_or("Unknown chip").to_string();
-
-  // SPHardwareDataType.0.machine_model
-  let mac_model = out["SPHardwareDataType"][0]["machine_model"].as_str();
-  let mac_model = mac_model.unwrap_or("Unknown model").to_string();
-
-  // SPHardwareDataType.0.physical_memory -> "x GB"
-  let mem_gb = out["SPHardwareDataType"][0]["physical_memory"].as_str();
-  let mem_gb = mem_gb.and_then(|x| x.strip_suffix(" GB")).and_then(|x| x.parse::<u64>().ok());
-  let mem_gb = mem_gb.unwrap_or(0);
-
-  // SPHardwareDataType.0.number_processors -> "proc x:y:z" or "proc x:y:z:w"
-  let number_processors = out["SPHardwareDataType"][0]["number_processors"].as_str().unwrap_or("");
-  let cpu_domain_units = parse_cpu_domain_units(number_processors);
-
-  // SPDisplaysDataType.0.sppci_cores
-  let gpu_cores = out["SPDisplaysDataType"][0]["sppci_cores"].as_str();
-  let gpu_cores = gpu_cores.unwrap_or("0").parse::<u64>().unwrap_or(0);
+  let native = || {
+    Some((
+      sysctl_string("machdep.cpu.brand_string")?,
+      sysctl_string("hw.model")?,
+      sysctl_value::<u64>("hw.memsize")? / (1024 * 1024 * 1024),
+      cpu_domain_units_native()?,
+      gpu_cores_native()?,
+    ))
+  };
+  let (chip_name, mac_model, mem_gb, cpu_domain_units, gpu_cores) = if let Some(values) = native() {
+    values
+  } else {
+    let out = run_system_profiler()?;
+    let hardware = &out["SPHardwareDataType"][0];
+    let display = &out["SPDisplaysDataType"][0];
+    let chip_name = hardware["chip_type"].as_str().unwrap_or("Unknown chip").to_string();
+    let mac_model = hardware["machine_model"].as_str().unwrap_or("Unknown model").to_string();
+    let mem_gb = hardware["physical_memory"]
+      .as_str()
+      .and_then(|s| s.strip_suffix(" GB"))
+      .and_then(|s| s.parse::<u64>().ok())
+      .unwrap_or(0);
+    let cpu_domain_units =
+      parse_cpu_domain_units(hardware["number_processors"].as_str().unwrap_or(""));
+    let gpu_cores = display["sppci_cores"].as_str().unwrap_or("0").parse::<u64>().unwrap_or(0);
+    (chip_name, mac_model, mem_gb, cpu_domain_units, gpu_cores)
+  };
 
   let cpu_scale = cpu_freq_scale(&chip_name);
   let gpu_scale: u32 = 1000 * 1000; // MHz
@@ -616,7 +735,18 @@ fn load_soc_info() -> WithError<SocInfo> {
       // 2) sudo powermetrics --samplers cpu_power -i 1000 -n 1 | grep "active residency" | grep "Cluster"
       for (idx, binding) in CPU_DOMAIN_BINDINGS.iter().enumerate() {
         let is_ecpu = binding.channel_prefix != "PCPU";
-        if let Some(f) = cpu_freqs(item, binding.pmgr_key, is_ecpu, cpu_scale) {
+        let tier = info
+          .chip_name
+          .strip_prefix("Apple M")
+          .and_then(|s| s.chars().next())
+          .and_then(|c| c.to_digit(10))
+          .filter(|generation| *generation >= 5)
+          .map(|_| match binding.channel_prefix {
+            "ECPU" => 0,
+            "MCPU" => 1,
+            _ => 2,
+          });
+        if let Some(f) = cpu_freqs(item, binding.pmgr_key, is_ecpu, cpu_scale, tier) {
           cpu_freq_tables[idx] = f;
         }
       }
@@ -1107,6 +1237,9 @@ mod tests {
     // Second-highest type (1 = Performance) as ecpu, highest (2 = Super) as pcpu
     assert_eq!(e, "voltage-states23-sram");
     assert_eq!(p, "voltage-states5-sram");
+    assert_eq!(acc_cluster_key(&data, 0).as_deref(), Some("voltage-states22-sram"));
+    assert_eq!(acc_cluster_key(&data, 1).as_deref(), Some("voltage-states23-sram"));
+    assert_eq!(acc_cluster_key(&data, 2).as_deref(), Some("voltage-states5-sram"));
   }
 
   #[test]
@@ -1125,6 +1258,18 @@ mod tests {
     assert_eq!(parse_cpu_domain_units("proc 16:12:4:0"), vec![4, 12, 0]);
     // M3 Air: 8 total, 4 performance, 4 efficiency, 0 M-cores
     assert_eq!(parse_cpu_domain_units("proc 8:4:4:0"), vec![4, 4, 0]);
+  }
+
+  #[test]
+  fn maps_native_cpu_tiers_for_legacy_and_new_chips() {
+    let tiers = |items: &[(&str, u64)]| {
+      let items: Vec<_> = items.iter().map(|(name, count)| (name.to_string(), *count)).collect();
+      cpu_domain_units_from_tiers(&items)
+    };
+    assert_eq!(tiers(&[("Performance", 8), ("Efficiency", 4)]), Some(vec![4, 8, 0]));
+    assert_eq!(tiers(&[("Super", 6), ("Performance", 12)]), Some(vec![0, 6, 12]));
+    assert_eq!(tiers(&[("Super", 4), ("Performance", 6), ("Efficiency", 4)]), Some(vec![4, 4, 6]));
+    assert_eq!(tiers(&[("Unknown", 8)]), None);
   }
 
   #[test]

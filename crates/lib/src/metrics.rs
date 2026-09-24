@@ -90,7 +90,9 @@ fn is_active_state(name: &str) -> bool {
 }
 
 fn calc_freq_from_residencies(items: &[(String, i64)], freqs: &[u32]) -> (u32, f32) {
-  let offset = items.iter().position(|x| is_active_state(x.0.as_str())).unwrap();
+  let Some(offset) = items.iter().position(|x| is_active_state(x.0.as_str())) else {
+    return (0, 0.0);
+  };
   assert!(
     items.len() >= offset + freqs.len(),
     "calc_freq invalid data: items={}, offset={}, freqs={}",
@@ -99,7 +101,7 @@ fn calc_freq_from_residencies(items: &[(String, i64)], freqs: &[u32]) -> (u32, f
     freqs.len()
   );
 
-  let usage = items.iter().map(|x| x.1 as f64).skip(offset).sum::<f64>();
+  let usage = items.iter().skip(offset).take(freqs.len()).map(|x| x.1 as f64).sum::<f64>();
   let total = items.iter().map(|x| x.1 as f64).sum::<f64>();
   let count = freqs.len();
 
@@ -118,7 +120,7 @@ fn calc_freq(item: CFDictionaryRef, freqs: &[u32]) -> (u32, f32) {
   calc_freq_from_residencies(&items, freqs)
 }
 
-fn calc_cluster_usage_at_peak_freq(cores: &[CoreUsageEntry]) -> (u32, f32) {
+fn calc_cluster_usage_at_peak_freq(cores: &[CoreUsageEntry], units: u32) -> (u32, f32) {
   let peak_freq = cores.iter().filter(|x| x.usage > 0.0).map(|x| x.freq_mhz).max().unwrap_or(0);
   if peak_freq == 0 {
     return (0, 0.0);
@@ -127,10 +129,29 @@ fn calc_cluster_usage_at_peak_freq(cores: &[CoreUsageEntry]) -> (u32, f32) {
   let peak_freq = peak_freq as f32;
   let usage = zero_div(
     cores.iter().map(|x| x.usage * x.freq_mhz as f32 / peak_freq).sum(),
-    cores.len() as f32,
+    cores.len().max(units as usize) as f32,
   );
 
   (peak_freq as u32, usage)
+}
+
+fn cpu_core_sort_key(channel: &str) -> (usize, usize, usize) {
+  let (die, rest) = channel
+    .strip_prefix("DIE_")
+    .and_then(|s| s.split_once('_'))
+    .map(|(die, rest)| (die.parse().unwrap_or(0), rest))
+    .unwrap_or((0, channel));
+  let suffix =
+    ["ECPU", "PCPU", "MCPU"].iter().find_map(|prefix| rest.strip_prefix(prefix)).unwrap_or(rest);
+  if let Some((cluster, core)) = suffix.split_once("_CPU") {
+    return (die, cluster.parse().unwrap_or(0), core.parse().unwrap_or(0));
+  }
+  (die, 0, suffix.parse().unwrap_or(0))
+}
+
+fn disabled_cpu_channel(items: &[(String, i64)]) -> bool {
+  items.iter().any(|(state, time)| state == "DOWN" && *time > 0)
+    && items.iter().all(|(state, time)| state == "DOWN" || *time == 0)
 }
 
 fn cpu_channel_domain_index(channel: &str, domains: &[CpuDomainInfo]) -> Option<usize> {
@@ -146,8 +167,8 @@ pub(crate) fn init_smc() -> WithError<(SMC, Vec<String>, Vec<String>)> {
   let names = smc.read_all_keys().unwrap_or(vec![]);
   for name in &names {
     // Unfortunately, it is not known which keys are responsible for what.
-    let is_cpu = name.starts_with("Tp0") || name.starts_with("Tp1");
-    let is_gpu = name.starts_with("Tg0");
+    let is_cpu = name.starts_with("Tp") || name.starts_with("Te") || name.starts_with("Ts");
+    let is_gpu = name.starts_with("Tg");
     if !is_cpu && !is_gpu {
       continue;
     }
@@ -288,7 +309,8 @@ impl Sampler {
     //           pattern as Energy Model's "DIE_{}_CPU Energy".
 
     let cpu_domains = self.soc.cpu_domains.clone();
-    let mut cpu_domain_cores = vec![Vec::new(); cpu_domains.len()];
+    let mut cpu_domain_cores: Vec<Vec<(String, CoreUsageEntry)>> =
+      vec![Vec::new(); cpu_domains.len()];
     let mut rs = Metrics::default();
 
     for x in self.ior.get_sample() {
@@ -298,8 +320,12 @@ impl Sampler {
         && let Some(domain_idx) = cpu_channel_domain_index(&x.channel, &cpu_domains)
       {
         let domain = &cpu_domains[domain_idx];
-        let (freq_mhz, usage) = calc_freq(x.item, &domain.freqs_mhz);
-        cpu_domain_cores[domain_idx].push(CoreUsageEntry { freq_mhz, usage });
+        let items = cfio_get_residencies(x.item);
+        if disabled_cpu_channel(&items) {
+          continue;
+        }
+        let (freq_mhz, usage) = calc_freq_from_residencies(&items, &domain.freqs_mhz);
+        cpu_domain_cores[domain_idx].push((x.channel.clone(), CoreUsageEntry { freq_mhz, usage }));
         continue;
       }
 
@@ -333,18 +359,19 @@ impl Sampler {
     }
 
     for (domain_idx, domain) in cpu_domains.iter().enumerate() {
-      let cores = &cpu_domain_cores[domain_idx];
-      if cores.is_empty() {
+      let channels = &mut cpu_domain_cores[domain_idx];
+      if channels.is_empty() {
         continue;
       }
-
-      let (freq_mhz, usage) = calc_cluster_usage_at_peak_freq(cores);
+      channels.sort_by_key(|(name, _)| cpu_core_sort_key(name));
+      let cores: Vec<_> = channels.iter().map(|(_, core)| core.clone()).collect();
+      let (freq_mhz, usage) = calc_cluster_usage_at_peak_freq(&cores, domain.units);
       rs.cpu_usage.push(CpuUsageEntry {
         name: domain.name.clone(),
         units: domain.units,
         freq_mhz,
         usage,
-        cores: cores.clone(),
+        cores,
       });
     }
 
@@ -365,7 +392,7 @@ impl Sampler {
 mod tests {
   use super::{
     CoreUsageEntry, calc_cluster_usage_at_peak_freq, calc_freq_from_residencies,
-    cpu_channel_domain_index,
+    cpu_channel_domain_index, cpu_core_sort_key, disabled_cpu_channel,
   };
   use crate::sources::CpuDomainInfo;
 
@@ -384,7 +411,7 @@ mod tests {
   }
 
   #[test]
-  fn calc_freq_with_mismatched_states_matches_legacy_mapping() {
+  fn calc_freq_excludes_states_outside_frequency_table() {
     let items = vec![
       ("IDLE".to_string(), 50),
       ("S1".to_string(), 0),
@@ -395,7 +422,7 @@ mod tests {
     let (freq, usage) = calc_freq_from_residencies(&items, &[1000, 2000]);
 
     assert_eq!(freq, 0);
-    assert!((usage - 0.5f32).abs() < 1e-6f32);
+    assert_eq!(usage, 0.0);
   }
 
   #[test]
@@ -410,7 +437,7 @@ mod tests {
   fn calc_cluster_usage_at_peak_freq_preserves_idle_frequency() {
     let cores =
       [CoreUsageEntry { freq_mhz: 0, usage: 0.0 }, CoreUsageEntry { freq_mhz: 0, usage: 0.0 }];
-    let (freq, usage) = calc_cluster_usage_at_peak_freq(&cores);
+    let (freq, usage) = calc_cluster_usage_at_peak_freq(&cores, 2);
 
     assert_eq!(freq, 0);
     assert_eq!(usage, 0.0);
@@ -430,10 +457,30 @@ mod tests {
       CoreUsageEntry { freq_mhz: 0, usage: 0.0 },
       CoreUsageEntry { freq_mhz: 0, usage: 0.0 },
     ];
-    let (freq, usage) = calc_cluster_usage_at_peak_freq(&items);
+    let (freq, usage) = calc_cluster_usage_at_peak_freq(&items, 12);
 
     assert_eq!(freq, 4500);
-    assert!((usage - 0.10666).abs() < 1e-5);
+    assert!((usage - 0.08888).abs() < 1e-5);
+  }
+
+  #[test]
+  fn sorts_ultra_cores_by_die_cluster_and_core() {
+    let mut channels =
+      ["DIE_1_PCPU_CPU0", "DIE_0_PCPU1_CPU0", "DIE_0_PCPU_CPU1", "DIE_0_PCPU_CPU0"];
+    channels.sort_by_key(|channel| cpu_core_sort_key(channel));
+    assert_eq!(
+      channels,
+      ["DIE_0_PCPU_CPU0", "DIE_0_PCPU_CPU1", "DIE_0_PCPU1_CPU0", "DIE_1_PCPU_CPU0"]
+    );
+  }
+
+  #[test]
+  fn excludes_all_down_disabled_cpu_channels() {
+    let disabled =
+      [("DOWN".to_string(), 100), ("IDLE".to_string(), 0), ("1000 MHz".to_string(), 0)];
+    assert!(disabled_cpu_channel(&disabled));
+    assert!(!disabled_cpu_channel(&[("DOWN".to_string(), 50), ("IDLE".to_string(), 50)]));
+    assert_eq!(calc_freq_from_residencies(&[("DOWN".to_string(), 100)], &[1000]), (0, 0.0));
   }
 
   #[test]
