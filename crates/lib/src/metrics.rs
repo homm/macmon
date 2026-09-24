@@ -149,11 +149,6 @@ fn cpu_core_sort_key(channel: &str) -> (usize, usize, usize) {
   (die, 0, suffix.parse().unwrap_or(0))
 }
 
-fn disabled_cpu_channel(items: &[(String, i64)]) -> bool {
-  items.iter().any(|(state, time)| state == "DOWN" && *time > 0)
-    && items.iter().all(|(state, time)| state == "DOWN" || *time == 0)
-}
-
 fn cpu_channel_domain_index(channel: &str, domains: &[CpuDomainInfo]) -> Option<usize> {
   domains.iter().position(|domain| channel.contains(domain.name.as_str()))
 }
@@ -321,9 +316,6 @@ impl Sampler {
       {
         let domain = &cpu_domains[domain_idx];
         let items = cfio_get_residencies(x.item);
-        if disabled_cpu_channel(&items) {
-          continue;
-        }
         let (freq_mhz, usage) = calc_freq_from_residencies(&items, &domain.freqs_mhz);
         cpu_domain_cores[domain_idx].push((x.channel.clone(), CoreUsageEntry { freq_mhz, usage }));
         continue;
@@ -392,7 +384,7 @@ impl Sampler {
 mod tests {
   use super::{
     CoreUsageEntry, calc_cluster_usage_at_peak_freq, calc_freq_from_residencies,
-    cpu_channel_domain_index, cpu_core_sort_key, disabled_cpu_channel,
+    cpu_channel_domain_index, cpu_core_sort_key,
   };
   use crate::sources::CpuDomainInfo;
 
@@ -475,11 +467,7 @@ mod tests {
   }
 
   #[test]
-  fn excludes_all_down_disabled_cpu_channels() {
-    let disabled =
-      [("DOWN".to_string(), 100), ("IDLE".to_string(), 0), ("1000 MHz".to_string(), 0)];
-    assert!(disabled_cpu_channel(&disabled));
-    assert!(!disabled_cpu_channel(&[("DOWN".to_string(), 50), ("IDLE".to_string(), 50)]));
+  fn all_down_cpu_channel_has_zero_usage() {
     assert_eq!(calc_freq_from_residencies(&[("DOWN".to_string(), 100)], &[1000]), (0, 0.0));
   }
 
