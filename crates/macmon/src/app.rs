@@ -397,7 +397,11 @@ impl App {
 
     let ram_pct = zero_div(ram_usage_gb, ram_total_gb) * 100.0;
     let label_l = format!("RAM {:4.2} / {:4.1} GB ({:.1}%)", ram_usage_gb, ram_total_gb, ram_pct);
-    let label_r = format!("SWAP {:.2} / {:.1} GB", swap_usage_gb, swap_total_gb);
+    let label_r = if val.swap_total > 0 {
+      format!("SWAP {:.2} / {:.1} GB", swap_usage_gb, swap_total_gb)
+    } else {
+      String::new()
+    };
 
     let block = self.title_block(label_l.as_str(), label_r.as_str());
     match self.cfg.view_type {

@@ -7,9 +7,13 @@ use macmon_lib::{Metrics, SocInfo};
 
 pub type SharedMetrics = Arc<RwLock<Option<Metrics>>>;
 
+fn escape_label_value(value: &str) -> String {
+  value.replace('\\', r"\\").replace('\n', r"\n").replace('"', r#"\""#)
+}
+
 #[rustfmt::skip]
 fn to_prometheus(m: &Metrics, soc: &SocInfo) -> String {
-  let chip = &soc.chip_name;
+  let chip = escape_label_value(&soc.chip_name);
   let l = format!(r#"chip="{chip}""#);
 
   macro_rules! gauge {
@@ -188,7 +192,7 @@ pub fn run(
   soc: Arc<SocInfo>,
 ) -> Result<(), Box<dyn std::error::Error>> {
   let listener = TcpListener::bind(format!("0.0.0.0:{port}"))?;
-  eprintln!("macmon serving on http://localhost:{port}");
+  eprintln!("macmon serving on http://{}", listener.local_addr()?);
   eprintln!("  GET /json    → JSON metrics");
   eprintln!("  GET /metrics → Prometheus format");
 
@@ -200,4 +204,14 @@ pub fn run(
   }
 
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::escape_label_value;
+
+  #[test]
+  fn escapes_prometheus_label_values() {
+    assert_eq!(escape_label_value("Mac\\Book\n\"Pro\""), r#"Mac\\Book\n\"Pro\""#);
+  }
 }
