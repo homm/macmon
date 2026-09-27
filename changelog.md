@@ -1,3 +1,11 @@
+## v0.7.3 – 2026-09-27
+
+### Fixes
+- Support new CPU topologies and macOS versions
+- Preserve CPU cores during DOWN residency
+
+---
+
 ## v0.7.2 – 2026-05-02
 
 ### Fixes
