@@ -389,6 +389,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Creating `Sampler` inside the worker also keeps its low-level macOS handles on that thread. `get_metrics()` consumes little CPU, but its synchronous macOS calls can block. For UI and async applications, use a worker thread to keep the event loop or executor responsive.
 
+### C API and Swift module
+
+`cargo build --release --locked --lib --no-default-features` produces `target/release/libmacmon.dylib`. The C interface is declared in [`include/macmon.h`](include/macmon.h); `make xcframework` packages it with the `CMacmon` module in `dist/CMacmon.xcframework`.
+
+Create, sample, and free each handle on the same thread. `macmon_sampler_get_metrics` does not wait for an interval; callers schedule reads. Snapshots expose the current CPU tiers, per-core active/scaled ratios, power, memory, temperatures, and fans. Missing temperatures and fan maximum RPM are exported as zero. Free returned metric and SoC snapshots with their matching API functions before reusing output slots. Check nonzero status codes with `macmon_last_error_message()` on the calling thread.
+
 ## 🤝 Contributing
 
 All contributions are welcome! Feel free to open an issue or submit a pull request.

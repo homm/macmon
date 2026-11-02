@@ -9,7 +9,7 @@ repository = "https://github.com/vladkens/macmon"
 homepage = "https://github.com/vladkens/macmon"
 documentation = "https://docs.rs/macmon"
 readme = "readme.md"
-include = ["/src/**", "/examples/demo.rs", "/Cargo.toml", "/Cargo.lock", "/LICENSE", "/readme.md"]
+include = ["/src/**", "/include/**", "/build.rs", "/examples/demo.rs", "/Cargo.toml", "/Cargo.lock", "/LICENSE", "/readme.md"]
 keywords = ["macos", "apple-silicon", "monitoring", "prometheus", "tui"]
 categories = ["command-line-utilities", "hardware-support", "visualization"]
 
@@ -21,6 +21,9 @@ targets = ["aarch64-apple-darwin"]
 name = "macmon"
 path = "src/app/main.rs"
 required-features = ["app"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["app"]

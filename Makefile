@@ -23,7 +23,15 @@ build:
 update:
 	cargo upgrade -i
 
-.PHONY: loc bench remote
+.PHONY: loc bench remote xcframework
+
+xcframework:
+	cargo build --lib --no-default-features $(CARGO_FLAGS)
+	rm -rf dist/CMacmon.xcframework
+	xcodebuild -create-xcframework \
+		-library "$(CURDIR)/target/release/libmacmon.dylib" \
+		-headers "$(CURDIR)/include" \
+		-output "$(CURDIR)/dist/CMacmon.xcframework"
 
 loc: # production lines, tests excluded; REF=origin/main compares with a git ref
 	@python3 scripts/loc.py $(REF)

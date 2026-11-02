@@ -1,0 +1,38 @@
+name: capi
+
+on:
+  push:
+    tags: ['capi-v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/cache@v6
+        with:
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+
+      - run: rustup update --no-self-update stable && rustup default stable
+      - run: make xcframework
+
+      - name: Archive XCFramework
+        id: archive
+        env:
+          CAPI_TAG: ${{ github.ref_name }}
+        run: |
+          ARCHIVE="CMacmon.xcframework-${CAPI_TAG#capi-}.zip"
+          ditto -c -k --sequesterRsrc --keepParent dist/CMacmon.xcframework "$ARCHIVE"
+          echo "file=$ARCHIVE" >> "$GITHUB_OUTPUT"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.archive.outputs.file }}
+          fail_on_unmatched_files: true

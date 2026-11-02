@@ -85,6 +85,8 @@
 
 mod clpc;
 
+pub mod ffi;
+
 #[cfg(feature = "app")]
 #[doc(hidden)]
 pub mod diagnostics;
