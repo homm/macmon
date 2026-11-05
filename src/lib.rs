@@ -78,6 +78,7 @@ pub mod diagnostics;
 #[doc(hidden)]
 pub mod metrics;
 mod shared;
+mod smc_sampler;
 pub mod sources;
 
 #[cfg(feature = "bench")]
@@ -88,5 +89,8 @@ pub use metrics::bench;
 pub use metrics::{
   CpuCoreMetrics, CpuTierMetrics, FanMetric, MemMetrics, Metrics, Sampler, TempMetrics,
 };
+#[cfg(feature = "bench")]
+#[doc(hidden)]
+pub use smc_sampler::SmcSampler;
 #[doc(inline)]
 pub use sources::{CpuTierInfo, SocInfo};

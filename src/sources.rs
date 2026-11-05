@@ -1605,6 +1605,24 @@ impl SMC {
     })
   }
 
+  /// Read an SMC value in one of the supported numeric formats.
+  pub fn read_numeric_value(&mut self, key: &str) -> WithError<f32> {
+    let value = self.read_val(key)?;
+    Self::decode_numeric_value(&value.data, &value.unit)
+      .ok_or_else(|| format!("Unsupported numeric SMC value for '{key}' ({})", value.unit).into())
+  }
+
+  fn decode_numeric_value(data: &[u8], unit: &str) -> Option<f32> {
+    match unit {
+      "flt " if data.len() == 4 => Some(f32::from_le_bytes(data.try_into().ok()?)),
+      "fpe2" if data.len() >= 2 => Some(((data[0] as u16) << 6 | ((data[1] as u16) >> 2)) as f32),
+      "ui8 " if !data.is_empty() => Some(data[0] as f32),
+      "ui16" if data.len() >= 2 => Some(u16::from_be_bytes(data[0..2].try_into().ok()?) as f32),
+      "ui32" if data.len() >= 4 => Some(u32::from_be_bytes(data[0..4].try_into().ok()?) as f32),
+      _ => None,
+    }
+  }
+
   /// Read a four-byte float SMC value.
   pub fn read_float_val(&mut self, key: &str) -> WithError<f32> {
     const FLOAT_TYPE: u32 = 1718383648; // FourCC: "flt "
@@ -1663,6 +1681,14 @@ impl Drop for SMC {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn parse_smc_numeric_values() {
+    assert_eq!(SMC::decode_numeric_value(&42.5f32.to_le_bytes(), "flt "), Some(42.5));
+    assert_eq!(SMC::decode_numeric_value(&[0x13, 0x88], "fpe2"), Some(1250.0));
+    assert_eq!(SMC::decode_numeric_value(&[0x04, 0xd2], "ui16"), Some(1234.0));
+    assert_eq!(SMC::decode_numeric_value(&[0x00, 0x00, 0x04, 0xd2], "ui32"), Some(1234.0));
+  }
 
   #[test]
   fn clpc_descriptors_preserve_driver_counter_ids_and_nanojoule_units() {

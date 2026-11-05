@@ -6,11 +6,14 @@ use std::time::Duration;
 use core_foundation::dictionary::CFDictionaryRef;
 use serde::Serialize;
 
+pub use crate::shared::{FanMetric, TempMetrics};
 use crate::shared::{
-  ioreport_channels_filter, is_clpc_energy_channel, is_pmp_ane_channel, zero_div,
+  ioreport_channels_filter, is_clpc_energy_channel, is_pmp_ane_channel, temperature_average,
+  zero_div,
 };
+use crate::smc_sampler::SmcSampler;
 use crate::sources::{
-  IOHIDSensors, IOReport, IOReportIteratorItem, SMC, SocInfo, cfio_get_residencies, cfio_watts,
+  IOHIDSensors, IOReport, IOReportIteratorItem, SocInfo, cfio_get_residencies, cfio_watts,
   cpu_load_ticks, get_soc_info, libc_ram, libc_swap,
 };
 
@@ -55,15 +58,6 @@ impl PowerSources {
 
 // MARK: Structs
 
-/// Average hardware temperatures.
-#[derive(Debug, Default, Serialize)]
-pub struct TempMetrics {
-  /// Average CPU temperature in Celsius, or None when unavailable.
-  pub cpu_temp_avg: Option<f32>,
-  /// Average GPU temperature in Celsius, or None when unavailable.
-  pub gpu_temp_avg: Option<f32>,
-}
-
 /// Memory and swap usage.
 #[derive(Debug, Default, Serialize)]
 pub struct MemMetrics {
@@ -75,17 +69,6 @@ pub struct MemMetrics {
   pub swap_total: u64,
   /// Used swap in bytes.
   pub swap_usage: u64,
-}
-
-/// Fan speed metrics.
-#[derive(Debug, Default, Serialize)]
-pub struct FanMetric {
-  /// Stable fan name derived from the fan order, e.g. `fan0`.
-  pub name: String,
-  /// Current fan speed in revolutions per minute.
-  pub rpm: u32,
-  /// Maximum fan speed in revolutions per minute, when reported by SMC.
-  pub max_rpm: Option<u32>,
 }
 
 /// Metrics for one CPU core.
@@ -117,14 +100,6 @@ pub struct CpuTierMetrics {
   pub active_ratio: f32,
   /// Metrics for each core, ordered by die and core index.
   pub cores: Vec<CpuCoreMetrics>,
-}
-
-#[derive(Default)]
-struct SmcSensors {
-  smc: Option<SMC>,
-  cpu_keys: Vec<String>,
-  gpu_keys: Vec<String>,
-  fan_keys: Vec<String>,
 }
 
 /// A complete metrics snapshot returned by [`Sampler`].
@@ -206,24 +181,6 @@ pub struct Metrics {
 
 // MARK: Helpers
 
-fn is_valid_temp(val: f32) -> bool {
-  val > 0.0 && val <= 150.0
-}
-
-/// Average of the valid sensor readings, or None when no sensor has one.
-fn temperature_average(values: &[f32]) -> Option<f32> {
-  let valid: Vec<f32> = values.iter().copied().filter(|&val| is_valid_temp(val)).collect();
-  (!valid.is_empty()).then(|| valid.iter().sum::<f32>() / valid.len() as f32)
-}
-
-fn is_valid_fan_rpm(val: f32) -> bool {
-  (0.0..=100_000.0).contains(&val)
-}
-
-fn fan_rpm_value(val: f32) -> Option<u32> {
-  if is_valid_fan_rpm(val) { Some(val.trunc() as u32) } else { None }
-}
-
 fn aggregate_frequency(cores: &[CpuCoreMetrics], min_frequency_mhz: u32) -> u32 {
   let average =
     zero_div(cores.iter().map(|core| core.freq_mhz as f64).sum::<f64>(), cores.len() as f64);
@@ -269,23 +226,6 @@ impl Metrics {
     }
     self
   }
-}
-
-fn smc_numeric_value(data: &[u8], unit: &str) -> Option<f32> {
-  match unit {
-    "flt " if data.len() == 4 => Some(f32::from_le_bytes(data.try_into().ok()?)),
-    "fpe2" if data.len() >= 2 => Some(((data[0] as u16) << 6 | ((data[1] as u16) >> 2)) as f32),
-    "ui8 " if !data.is_empty() => Some(data[0] as f32),
-    "ui16" if data.len() >= 2 => Some(u16::from_be_bytes(data[0..2].try_into().ok()?) as f32),
-    "ui32" if data.len() >= 4 => Some(u32::from_be_bytes(data[0..4].try_into().ok()?) as f32),
-    _ => None,
-  }
-}
-
-fn read_smc_numeric_u32(smc: &mut SMC, key: &str) -> Option<u32> {
-  let val = smc.read_val(key).ok()?;
-  let val = smc_numeric_value(&val.data, &val.unit)?;
-  fan_rpm_value(val)
 }
 
 fn calc_freq_from_residencies(items: &[(String, i64)], freqs: &[u32]) -> FreqMetrics {
@@ -482,66 +422,9 @@ pub mod bench {
     IOReport::with_filter(Some(ioreport_channels_filter))?.ok_or("no IOReport channels".into())
   }
 
-  pub fn init_smc() -> WithError<impl Sized> {
-    super::init_smc()
-  }
-
   pub fn get_sample(ior: &mut IOReport) -> (crate::sources::IOReportIterator, Duration) {
     ior.get_sample_interval(Duration::ZERO)
   }
-
-  pub fn read_smc_keys(sampler: &mut Sampler) -> WithError<(TempMetrics, Vec<FanMetric>, f32)> {
-    let temp = sampler.get_temp_smc()?;
-    let fans = sampler.get_fans();
-    let power = sampler.get_sys_power().unwrap_or(0.0);
-    Ok((temp, fans, power))
-  }
-
-  pub fn get_temp_smc(sampler: &mut Sampler) -> WithError<TempMetrics> {
-    sampler.get_temp_smc()
-  }
-}
-
-fn init_smc() -> WithError<SmcSensors> {
-  let Some(mut smc) = SMC::open()? else { return Ok(SmcSensors::default()) };
-
-  let mut cpu_sensors = Vec::new();
-  let mut gpu_sensors = Vec::new();
-  let mut fan_sensors = Vec::new();
-
-  let names = smc.read_all_keys().unwrap_or(vec![]);
-  for name in &names {
-    if name.len() == 4 && name.starts_with('F') && name.ends_with("Ac") {
-      fan_sensors.push(name.clone());
-      continue;
-    }
-    // Unfortunately, it is not known which keys are responsible for what.
-    // Basically in the code that can be found publicly "Tp" is used for CPU and "Tg" for GPU.
-
-    let is_cpu = name.starts_with("Tp") || name.starts_with("Te") || name.starts_with("Ts");
-    let is_gpu = name.starts_with("Tg");
-    if !is_cpu && !is_gpu {
-      continue;
-    }
-
-    if smc.read_float_val(name).is_err() {
-      continue;
-    }
-
-    if is_cpu {
-      cpu_sensors.push(name.clone());
-    } else if is_gpu {
-      gpu_sensors.push(name.clone());
-    }
-  }
-
-  // Sort first so fan order is stable and any duplicate keys become adjacent for dedup().
-  fan_sensors.sort();
-  fan_sensors.dedup();
-
-  // println!("{} {}", cpu_sensors.len(), gpu_sensors.len());
-  let (cpu_keys, gpu_keys, fan_keys) = (cpu_sensors, gpu_sensors, fan_sensors);
-  Ok(SmcSensors { smc: Some(smc), cpu_keys, gpu_keys, fan_keys })
 }
 
 // MARK: Sampler
@@ -560,10 +443,7 @@ pub struct Sampler {
   /// CPU ticks at the end of the last sample; the first sample takes its own baseline.
   cpu_ticks: Option<Vec<[u32; 4]>>,
   hid: IOHIDSensors,
-  smc: Option<SMC>,
-  smc_cpu_keys: Vec<String>,
-  smc_gpu_keys: Vec<String>,
-  smc_fan_keys: Vec<String>,
+  smc: SmcSampler,
 }
 
 impl Sampler {
@@ -572,23 +452,12 @@ impl Sampler {
     let soc = get_soc_info()?;
     let ior = IOReport::with_filter(Some(ioreport_channels_filter))?;
     let hid = IOHIDSensors::new()?;
-    let smc_sensors = init_smc()?;
+    let smc = SmcSampler::new(None)?;
 
     let cpu_stats = ior.as_ref().is_some_and(|x| x.has_group("CPU Stats"));
     let use_cpu_ticks = uses_cpu_ticks(&soc, cpu_stats);
 
-    Ok(Sampler {
-      force_clpc: false,
-      soc,
-      ior,
-      use_cpu_ticks,
-      cpu_ticks: None,
-      hid,
-      smc: smc_sensors.smc,
-      smc_cpu_keys: smc_sensors.cpu_keys,
-      smc_gpu_keys: smc_sensors.gpu_keys,
-      smc_fan_keys: smc_sensors.fan_keys,
-    })
+    Ok(Sampler { force_clpc: false, soc, ior, use_cpu_ticks, cpu_ticks: None, hid, smc })
   }
 
   /// Require valid CLPC counters for CPU, GPU, and ANE power, without legacy fallback.
@@ -599,22 +468,9 @@ impl Sampler {
     Ok(sampler)
   }
 
-  fn get_temp_smc(&mut self) -> WithError<TempMetrics> {
-    let smc = self.smc.as_mut().ok_or("SMC unavailable")?;
-    let mut cpu_metrics = Vec::new();
-    for sensor in &self.smc_cpu_keys {
-      cpu_metrics.push(smc.read_float_val(sensor)?);
-    }
-
-    let mut gpu_metrics = Vec::new();
-    for sensor in &self.smc_gpu_keys {
-      gpu_metrics.push(smc.read_float_val(sensor)?);
-    }
-
-    let cpu_temp_avg = temperature_average(&cpu_metrics);
-    let gpu_temp_avg = temperature_average(&gpu_metrics);
-
-    Ok(TempMetrics { cpu_temp_avg, gpu_temp_avg })
+  /// Set the SMC snapshot lifetime (one second by default). Zero disables caching.
+  pub fn set_smc_cache_duration(&mut self, duration: Duration) {
+    self.smc.set_cache_duration(duration);
   }
 
   fn get_temp_hid(&mut self) -> WithError<TempMetrics> {
@@ -643,38 +499,10 @@ impl Sampler {
     Ok(TempMetrics { cpu_temp_avg, gpu_temp_avg })
   }
 
-  fn get_temp(&mut self) -> WithError<TempMetrics> {
-    // HID for M1, SMC for M2/M3
-    // UPD: Looks like HID/SMC related to OS version, not to the chip (SMC available from macOS 14)
-    match !self.smc_cpu_keys.is_empty() {
-      true => self.get_temp_smc(),
-      false => self.get_temp_hid(),
-    }
-  }
-
-  fn get_fans(&mut self) -> Vec<FanMetric> {
-    let mut fans = Vec::new();
-    let Some(smc) = self.smc.as_mut() else { return fans };
-    for (i, key) in self.smc_fan_keys.iter().enumerate() {
-      let Some(rpm) = read_smc_numeric_u32(smc, key) else { continue };
-      let name = format!("fan{i}");
-      let max_rpm = match key.strip_suffix("Ac") {
-        Some(prefix) => read_smc_numeric_u32(smc, &format!("{prefix}Mx")).filter(|rpm| *rpm > 0),
-        None => None,
-      };
-      fans.push(FanMetric { name, rpm, max_rpm });
-    }
-    fans
-  }
-
   fn get_mem(&mut self) -> WithError<MemMetrics> {
     let (ram_usage, ram_total) = libc_ram()?;
     let (swap_usage, swap_total) = libc_swap()?;
     Ok(MemMetrics { ram_total, ram_usage, swap_total, swap_usage })
-  }
-
-  fn get_sys_power(&mut self) -> WithError<f32> {
-    self.smc.as_mut().ok_or("SMC unavailable")?.read_float_val("PSTR")
   }
 
   fn get_ioreport_metrics(
@@ -801,13 +629,13 @@ impl Sampler {
     let mut rs = aggregate_ioreport_metrics(rs, &self.soc);
 
     rs.memory = self.get_mem()?;
-    rs.temp = self.get_temp()?;
-    rs.fans = self.get_fans();
-
-    rs.sys_power = match self.get_sys_power() {
-      Ok(val) => val.max(rs.all_power),
-      Err(_) => 0.0,
+    let smc = self.smc.get_metrics()?;
+    rs.temp = match smc.temp {
+      Some(temp) => temp,
+      None => self.get_temp_hid()?,
     };
+    rs.fans = smc.fans;
+    rs.sys_power = smc.sys_power.map_or(0.0, |val| val.max(rs.all_power));
 
     Ok(rs)
   }
@@ -830,8 +658,7 @@ mod tests {
   use super::{
     CpuCoreKind, CpuCoreMetrics, CpuTierCores, CpuTierMetrics, Metrics, PowerSources, Sampler,
     TempMetrics, aggregate_ioreport_metrics, calc_freq_from_residencies, collect_cpu_core_metrics,
-    cpu_cores_from_ticks, parse_cpu_core_channel, smc_numeric_value, temperature_average,
-    uses_cpu_ticks,
+    cpu_cores_from_ticks, parse_cpu_core_channel, temperature_average, uses_cpu_ticks,
   };
   use crate::sources::{
     CpuTierInfo, IOHIDSensors, IOReportIteratorItem, SocInfo, cpu_load_ticks, cpu_tier_infos,
@@ -908,10 +735,7 @@ mod tests {
       use_cpu_ticks: true,
       cpu_ticks: None,
       hid: IOHIDSensors::new().unwrap(),
-      smc: None,
-      smc_cpu_keys: vec![],
-      smc_gpu_keys: vec![],
-      smc_fan_keys: vec![],
+      smc: crate::smc_sampler::tests::without_sources(),
     }
   }
 
@@ -1016,14 +840,6 @@ mod tests {
     let tier =
       |label: &str, cores| CpuTierMetrics { label: label.into(), cores, ..Default::default() };
     vec![tier("E", ecpu), tier("P", pcpu)]
-  }
-
-  #[test]
-  fn parse_smc_numeric_values() {
-    assert_eq!(smc_numeric_value(&42.5f32.to_le_bytes(), "flt "), Some(42.5));
-    assert_eq!(smc_numeric_value(&[0x13, 0x88], "fpe2"), Some(1250.0));
-    assert_eq!(smc_numeric_value(&[0x04, 0xd2], "ui16"), Some(1234.0));
-    assert_eq!(smc_numeric_value(&[0x00, 0x00, 0x04, 0xd2], "ui32"), Some(1234.0));
   }
 
   #[test]
