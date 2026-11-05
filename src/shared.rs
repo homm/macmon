@@ -80,12 +80,19 @@ pub(crate) fn ioreport_channels_filter(
     return subgroup == "CPU Core Performance States";
   }
 
-  group == "GPU Stats" && subgroup == "GPU Performance States"
+  group == "GPU Stats" && subgroup == "GPU Performance States" && channel == "GPUPH"
 }
 
 #[cfg(test)]
 mod tests {
   use super::ioreport_channels_filter;
+
+  #[test]
+  fn subscribes_only_to_gpu_frequency_residencies() {
+    assert!(ioreport_channels_filter("GPU Stats", "GPU Performance States", "GPUPH", ""));
+    assert!(!ioreport_channels_filter("GPU Stats", "GPU Performance States", "OTHER", ""));
+    assert!(!ioreport_channels_filter("GPU Stats", "Other States", "GPUPH", ""));
+  }
 
   #[test]
   fn subscribes_only_to_known_clpc_energy_counters() {
