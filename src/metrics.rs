@@ -473,6 +473,35 @@ fn uses_cpu_ticks(soc: &SocInfo, cpu_stats: bool) -> bool {
   soc.cpu_tiers.len() == 1 && !(cpu_stats && freqs)
 }
 
+#[cfg(feature = "bench")]
+#[doc(hidden)]
+pub mod bench {
+  use super::*;
+
+  pub fn init_ioreport() -> WithError<IOReport> {
+    IOReport::with_filter(Some(ioreport_channels_filter))?.ok_or("no IOReport channels".into())
+  }
+
+  pub fn init_smc() -> WithError<impl Sized> {
+    super::init_smc()
+  }
+
+  pub fn get_sample(ior: &mut IOReport) -> (crate::sources::IOReportIterator, Duration) {
+    ior.get_sample_interval(Duration::ZERO)
+  }
+
+  pub fn read_smc_keys(sampler: &mut Sampler) -> WithError<(TempMetrics, Vec<FanMetric>, f32)> {
+    let temp = sampler.get_temp_smc()?;
+    let fans = sampler.get_fans();
+    let power = sampler.get_sys_power().unwrap_or(0.0);
+    Ok((temp, fans, power))
+  }
+
+  pub fn get_temp_smc(sampler: &mut Sampler) -> WithError<TempMetrics> {
+    sampler.get_temp_smc()
+  }
+}
+
 fn init_smc() -> WithError<SmcSensors> {
   let Some(mut smc) = SMC::open()? else { return Ok(SmcSensors::default()) };
 

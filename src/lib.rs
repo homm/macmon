@@ -80,6 +80,9 @@ pub mod metrics;
 mod shared;
 pub mod sources;
 
+#[cfg(feature = "bench")]
+#[doc(hidden)]
+pub use metrics::bench;
 // Re-export the commonly used types.
 #[doc(inline)]
 pub use metrics::{
