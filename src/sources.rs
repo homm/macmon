@@ -82,8 +82,8 @@ pub fn cfstr(val: &str) -> CFStringRef {
 /// Convert a CoreFoundation string reference into a Rust `String`.
 pub fn from_cfstr(val: CFStringRef) -> String {
   unsafe {
-    let mut buf = Vec::with_capacity(128);
-    if CFStringGetCString(val, buf.as_mut_ptr(), 128, kCFStringEncodingUTF8) == 0 {
+    let mut buf = [0; 128];
+    if CFStringGetCString(val, buf.as_mut_ptr(), buf.len() as isize, kCFStringEncodingUTF8) == 0 {
       panic!("Failed to convert CFString to CString");
     }
     std::ffi::CStr::from_ptr(buf.as_ptr()).to_string_lossy().to_string()

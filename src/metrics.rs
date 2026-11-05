@@ -242,11 +242,11 @@ fn calc_freq_from_residencies(items: &[(String, i64)], freqs: &[u32]) -> FreqMet
   let usage = items.iter().skip(offset).take(freqs.len()).map(|x| x.1 as f64).sum::<f64>();
   let total = items.iter().map(|x| x.1 as f64).sum::<f64>();
 
-  let mut avg_freq = 0f64;
+  let mut weighted_freq = 0f64;
   for i in 0..freqs.len() {
-    let percent = zero_div(items[i + offset].1 as _, usage);
-    avg_freq += percent * freqs[i] as f64;
+    weighted_freq += items[i + offset].1 as f64 * freqs[i] as f64;
   }
+  let avg_freq = zero_div(weighted_freq, usage);
 
   let active_ratio = zero_div(usage, total);
   let min_freq = *freqs.first().unwrap() as f64;
@@ -331,27 +331,44 @@ fn freqs_fit(residencies: &[(String, i64)], freqs: &[u32]) -> bool {
   !freqs.is_empty() && residencies.len() > freqs.len() && states >= freqs.len()
 }
 
+/// Cached channel classification and output ordering for one sampler's fixed CPU tiers.
+#[derive(Default)]
+struct CpuTopology {
+  channels: HashMap<CpuCoreKey, Option<usize>>,
+  tiers: Vec<Vec<(CpuCoreKey, usize, usize)>>,
+}
+
 /// Per-core metrics of the tiers of `SocInfo::cpu_tiers`, keyed by IOReport channel.
 struct CpuTierCores<'a> {
   soc: &'a SocInfo,
+  topology: &'a mut CpuTopology,
   tiers: Vec<HashMap<CpuCoreKey, FreqMetrics>>,
 }
 
 impl<'a> CpuTierCores<'a> {
-  fn new(soc: &'a SocInfo) -> Self {
-    Self { soc, tiers: vec![HashMap::new(); soc.cpu_tiers.len()] }
+  fn new(soc: &'a SocInfo, topology: &'a mut CpuTopology) -> Self {
+    topology.tiers.resize_with(soc.cpu_tiers.len(), Vec::new);
+    Self { soc, topology, tiers: vec![HashMap::new(); soc.cpu_tiers.len()] }
   }
 
   /// Adds the core of a "CPU Core Performance States" `channel` from its state residencies, or
   /// returns false when the channel is not a CPU core.
   fn add(&mut self, channel: &str, residencies: &[(String, i64)]) -> bool {
-    let Some((kind, key)) = parse_cpu_core_channel(channel) else { return false };
-    let Some(i) = cpu_tier_index(kind, self.tiers.len()) else { return false };
+    let tier = match self.topology.channels.get(channel) {
+      Some(tier) => *tier,
+      None => {
+        let tier = parse_cpu_core_channel(channel)
+          .and_then(|(kind, _)| cpu_tier_index(kind, self.tiers.len()));
+        self.topology.channels.insert(channel.to_owned(), tier);
+        tier
+      }
+    };
+    let Some(i) = tier else { return false };
     // A table with more frequencies than the core has states belongs to another complex (say a
     // future middle tier with its own); leave the core out instead of aborting on it.
     let freqs = &self.soc.cpu_tiers[i].freqs;
     if freqs_fit(residencies, freqs) {
-      self.tiers[i].insert(key, calc_freq_from_residencies(residencies, freqs));
+      self.tiers[i].insert(channel.to_owned(), calc_freq_from_residencies(residencies, freqs));
     }
     true
   }
@@ -359,36 +376,50 @@ impl<'a> CpuTierCores<'a> {
   /// Tiers with their cores; `aggregate_ioreport_metrics` fills in the tier values.
   fn into_metrics(self) -> Vec<CpuTierMetrics> {
     let labels = self.soc.cpu_tiers.iter().map(|tier| tier.label.clone());
-    let tier = |(label, cores)| CpuTierMetrics {
+    let tier = |((label, cores), topology): (_, &mut Vec<_>)| CpuTierMetrics {
       label,
-      cores: collect_cpu_core_metrics(cores),
+      cores: collect_cpu_core_metrics(cores, topology),
       ..Default::default()
     };
-    labels.zip(self.tiers).map(tier).collect()
+    labels.zip(self.tiers).zip(&mut self.topology.tiers).map(tier).collect()
   }
 }
 
-fn collect_cpu_core_metrics(metrics: HashMap<CpuCoreKey, FreqMetrics>) -> Vec<CpuCoreMetrics> {
-  let mut metrics: Vec<_> = metrics.into_iter().collect();
-  metrics.sort_by_key(|(channel, _)| cpu_core_sort_key(channel));
-  let mut next_clustered_core_id = HashMap::<usize, usize>::new();
+fn collect_cpu_core_metrics(
+  metrics: HashMap<CpuCoreKey, FreqMetrics>,
+  topology: &mut Vec<(CpuCoreKey, usize, usize)>,
+) -> Vec<CpuCoreMetrics> {
+  // Rebuild only when the observed set changes, preserving dense Ultra IDs when cores disappear.
+  if topology.len() != metrics.len()
+    || topology.iter().any(|(key, _, _)| !metrics.contains_key(key))
+  {
+    let mut channels: Vec<_> = metrics.keys().cloned().collect();
+    channels.sort_by_key(|channel| cpu_core_sort_key(channel));
+    let mut next_clustered_core_id = HashMap::<usize, usize>::new();
+    *topology = channels
+      .into_iter()
+      .map(|channel| {
+        let die_id = parse_die_id(&channel);
+        let core_id = if channel.contains("_CPU") {
+          let next = next_clustered_core_id.entry(die_id).or_default();
+          let core_id = *next;
+          *next += 1;
+          core_id
+        } else {
+          cpu_core_prefix(&channel)
+            .and_then(|prefix| parse_cpu_core_id(&channel, prefix))
+            .unwrap_or_default()
+        };
 
-  metrics
-    .into_iter()
-    .map(|(channel, (freq_mhz, scaled_ratio, active_ratio))| {
-      let die_id = parse_die_id(&channel);
-      let core_id = if channel.contains("_CPU") {
-        let next = next_clustered_core_id.entry(die_id).or_default();
-        let core_id = *next;
-        *next += 1;
-        core_id
-      } else {
-        cpu_core_prefix(&channel)
-          .and_then(|prefix| parse_cpu_core_id(&channel, prefix))
-          .unwrap_or_default()
-      };
-
-      CpuCoreMetrics { die_id, core_id, freq_mhz, scaled_ratio, active_ratio }
+        (channel, die_id, core_id)
+      })
+      .collect();
+  }
+  topology
+    .iter()
+    .map(|(channel, die_id, core_id)| {
+      let (freq_mhz, scaled_ratio, active_ratio) = metrics[channel];
+      CpuCoreMetrics { die_id: *die_id, core_id: *core_id, freq_mhz, scaled_ratio, active_ratio }
     })
     .collect()
 }
@@ -442,6 +473,7 @@ pub struct Sampler {
   use_cpu_ticks: bool,
   /// CPU ticks at the end of the last sample; the first sample takes its own baseline.
   cpu_ticks: Option<Vec<[u32; 4]>>,
+  cpu_topology: CpuTopology,
   hid: IOHIDSensors,
   smc: SmcSampler,
 }
@@ -457,7 +489,16 @@ impl Sampler {
     let cpu_stats = ior.as_ref().is_some_and(|x| x.has_group("CPU Stats"));
     let use_cpu_ticks = uses_cpu_ticks(&soc, cpu_stats);
 
-    Ok(Sampler { force_clpc: false, soc, ior, use_cpu_ticks, cpu_ticks: None, hid, smc })
+    Ok(Sampler {
+      force_clpc: false,
+      soc,
+      ior,
+      use_cpu_ticks,
+      cpu_ticks: None,
+      cpu_topology: CpuTopology::default(),
+      hid,
+      smc,
+    })
   }
 
   /// Require valid CLPC counters for CPU, GPU, and ANE power, without legacy fallback.
@@ -506,11 +547,11 @@ impl Sampler {
   }
 
   fn get_ioreport_metrics(
-    &self,
+    &mut self,
     sample: impl IntoIterator<Item = IOReportIteratorItem>,
     dt: Duration,
   ) -> WithError<Metrics> {
-    let mut cpu_cores = CpuTierCores::new(&self.soc);
+    let mut cpu_cores = CpuTierCores::new(&self.soc, &mut self.cpu_topology);
     let mut rs = Metrics::default();
     let mut cpu_power = PowerSources::default();
     let mut gpu_power = PowerSources::default();
@@ -656,9 +697,10 @@ mod tests {
   use core_foundation::string::CFString;
 
   use super::{
-    CpuCoreKind, CpuCoreMetrics, CpuTierCores, CpuTierMetrics, Metrics, PowerSources, Sampler,
-    TempMetrics, aggregate_ioreport_metrics, calc_freq_from_residencies, collect_cpu_core_metrics,
-    cpu_cores_from_ticks, parse_cpu_core_channel, temperature_average, uses_cpu_ticks,
+    CpuCoreKind, CpuCoreMetrics, CpuTierCores, CpuTierMetrics, CpuTopology, Metrics, PowerSources,
+    Sampler, TempMetrics, aggregate_ioreport_metrics, calc_freq_from_residencies,
+    collect_cpu_core_metrics, cpu_cores_from_ticks, parse_cpu_core_channel, temperature_average,
+    uses_cpu_ticks,
   };
   use crate::sources::{
     CpuTierInfo, IOHIDSensors, IOReportIteratorItem, SocInfo, cpu_load_ticks, cpu_tier_infos,
@@ -734,6 +776,7 @@ mod tests {
       ior: None,
       use_cpu_ticks: true,
       cpu_ticks: None,
+      cpu_topology: CpuTopology::default(),
       hid: IOHIDSensors::new().unwrap(),
       smc: crate::smc_sampler::tests::without_sources(),
     }
@@ -932,7 +975,8 @@ mod tests {
   #[test]
   fn routes_core_channels_to_the_lowest_and_highest_tier() {
     let soc = soc_info(1, 1);
-    let mut cores = CpuTierCores::new(&soc);
+    let mut topology = CpuTopology::default();
+    let mut cores = CpuTierCores::new(&soc, &mut topology);
     let busy = [("IDLE".to_string(), 50), ("V0P0".to_string(), 50)];
     // ECPU, and MCPU of M5 Pro/Max, go to the lowest tier; PCPU, also on Ultra, to the highest
     for channel in ["ECPU0", "MCPU3", "PCPU0", "DIE_1_PCPU1_CPU0"] {
@@ -992,7 +1036,8 @@ mod tests {
       ("PACC0_MCPU5", 20, 2497252, &[]),
     ];
     let soc = m6_soc();
-    let mut cores = CpuTierCores::new(&soc);
+    let mut topology = CpuTopology::default();
+    let mut cores = CpuTierCores::new(&soc, &mut topology);
     for (channel, states, idle, active) in channels {
       assert!(cores.add(channel, &residencies(states, idle, active)), "{channel}");
     }
@@ -1026,7 +1071,8 @@ mod tests {
   #[test]
   fn routes_mcpu_to_the_middle_of_three_tiers() {
     let soc = m6_soc();
-    let mut cores = CpuTierCores::new(&soc);
+    let mut topology = CpuTopology::default();
+    let mut cores = CpuTierCores::new(&soc, &mut topology);
     let busy = |states| residencies(states, 50, &[(0, 50)]);
     for (channel, states) in [("EACC_ECPU0", 7), ("PACC0_MCPU2", 20), ("PACC0_PCPU0", 20)] {
       assert!(cores.add(channel, &busy(states)), "{channel}");
@@ -1040,20 +1086,60 @@ mod tests {
   fn skips_a_core_with_fewer_states_than_its_table() {
     // a middle tier in its own complex with 16 states, against the 20 of the P-complex table
     let soc = m6_soc();
-    let mut cores = CpuTierCores::new(&soc);
+    let mut topology = CpuTopology::default();
+    let mut cores = CpuTierCores::new(&soc, &mut topology);
     assert!(cores.add("MACC_MCPU0", &residencies(16, 50, &[(15, 50)])));
     assert!(cores.into_metrics()[1].cores.is_empty());
   }
 
   #[test]
   fn orders_named_core_metrics() {
-    let cores = collect_cpu_core_metrics(HashMap::from([
-      ("DIE_1_ECPU0".into(), (2000, 0.50, 0.75)),
-      ("DIE_0_ECPU1".into(), (1000, 0.25, 0.50)),
-    ]));
+    let cores = collect_cpu_core_metrics(
+      HashMap::from([
+        ("DIE_1_ECPU0".into(), (2000, 0.50, 0.75)),
+        ("DIE_0_ECPU1".into(), (1000, 0.25, 0.50)),
+      ]),
+      &mut Vec::new(),
+    );
 
     assert_eq!((cores[0].die_id, cores[0].core_id), (0, 1));
     assert_eq!((cores[1].die_id, cores[1].core_id), (1, 0));
+  }
+
+  #[test]
+  fn cached_topology_handles_reordered_missing_and_returning_cores() {
+    let soc = m6_soc();
+    let mut topology = CpuTopology::default();
+    let first = "DIE_0_PCPU_CPU0";
+    let second = "DIE_0_PCPU1_CPU0";
+    let other_die = "DIE_1_PCPU_CPU0";
+    for channels in [
+      vec![first, second, other_die],
+      vec![other_die, second, first],
+      vec![second, other_die],
+      vec![],
+      vec![other_die, first, second],
+    ] {
+      let mut cores = CpuTierCores::new(&soc, &mut topology);
+      for channel in &channels {
+        let idle = if *channel == first { 100 } else { 50 };
+        assert!(cores.add(channel, &residencies(20, idle, &[(19, 50)])));
+      }
+      let tiers = cores.into_metrics();
+      assert!(tiers[0].cores.is_empty() && tiers[1].cores.is_empty());
+      let result = &tiers[2].cores;
+      let ids = result.iter().map(|core| (core.die_id, core.core_id)).collect::<Vec<_>>();
+      match channels.len() {
+        0 => assert!(ids.is_empty()),
+        2 => assert_eq!(ids, [(0, 0), (1, 0)]),
+        3 => {
+          assert_eq!(ids, [(0, 0), (0, 1), (1, 0)]);
+          assert!((result[0].active_ratio - 1.0 / 3.0).abs() < 1e-6);
+          assert_eq!(result[1].active_ratio, 0.5);
+        }
+        _ => unreachable!(),
+      }
+    }
   }
 
   #[test]
@@ -1071,6 +1157,15 @@ mod tests {
     assert_eq!(frequency, 1800);
     assert!((scaled_ratio - 0.45).abs() < f32::EPSILON);
     assert!((active_ratio - 0.5).abs() < f32::EPSILON);
+    for idle in [0, 500] {
+      assert_eq!(
+        calc_freq_from_residencies(
+          &[("IDLE".into(), idle), ("1000 MHz".into(), 0), ("2000 MHz".into(), 0)],
+          &[1000, 2000],
+        ),
+        (0, 0.0, 0.0),
+      );
+    }
   }
 
   #[test]
@@ -1142,12 +1237,15 @@ mod tests {
 
   #[test]
   fn flattens_real_ultra_cluster_channels_into_core_ids() {
-    let cores = collect_cpu_core_metrics(HashMap::from([
-      ("DIE_0_PCPU1_CPU0".into(), (2000, 0.50, 0.75)),
-      ("DIE_0_PCPU_CPU1".into(), (1100, 0.25, 0.50)),
-      ("DIE_0_PCPU_CPU0".into(), (1000, 0.20, 0.40)),
-      ("DIE_1_PCPU_CPU0".into(), (1200, 0.30, 0.60)),
-    ]));
+    let cores = collect_cpu_core_metrics(
+      HashMap::from([
+        ("DIE_0_PCPU1_CPU0".into(), (2000, 0.50, 0.75)),
+        ("DIE_0_PCPU_CPU1".into(), (1100, 0.25, 0.50)),
+        ("DIE_0_PCPU_CPU0".into(), (1000, 0.20, 0.40)),
+        ("DIE_1_PCPU_CPU0".into(), (1200, 0.30, 0.60)),
+      ]),
+      &mut Vec::new(),
+    );
 
     assert_eq!(
       cores.iter().map(|core| (core.die_id, core.core_id, core.freq_mhz)).collect::<Vec<_>>(),
