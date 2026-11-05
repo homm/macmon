@@ -1502,6 +1502,18 @@ pub struct SensorVal {
 
 // MARK: SMC
 
+/// A key and its lazily loaded metadata, retained between reads on one SMC connection.
+pub(crate) struct SmcKey {
+  key: u32,
+  info: Option<KeyInfo>,
+}
+
+impl SmcKey {
+  pub(crate) fn new(name: &str) -> WithError<Self> {
+    Ok(Self { key: SMC::parse_key(name)?, info: None })
+  }
+}
+
 #[allow(clippy::upper_case_acronyms)]
 /// Apple System Management Controller connection.
 pub struct SMC {
@@ -1607,9 +1619,40 @@ impl SMC {
 
   /// Read an SMC value in one of the supported numeric formats.
   pub fn read_numeric_value(&mut self, key: &str) -> WithError<f32> {
-    let value = self.read_val(key)?;
-    Self::decode_numeric_value(&value.data, &value.unit)
-      .ok_or_else(|| format!("Unsupported numeric SMC value for '{key}' ({})", value.unit).into())
+    let mut key = SmcKey { key: Self::parse_key(key)?, info: Some(self.read_key_info(key)?) };
+    self.read_numeric_key(&mut key)
+  }
+
+  pub(crate) fn prepare_key(&mut self, name: &str) -> WithError<SmcKey> {
+    Ok(SmcKey { key: Self::parse_key(name)?, info: Some(self.read_key_info(name)?) })
+  }
+
+  pub(crate) fn read_float_key(&self, key: &mut SmcKey) -> WithError<f32> {
+    let value = self.read_numeric_key(key)?;
+    let info = key.info.ok_or("SMC metadata unavailable")?;
+    if info.data_type != u32::from_be_bytes(*b"flt ") || info.data_size != 4 {
+      return Err("SMC key is not a 4-byte float".into());
+    }
+    Ok(value)
+  }
+
+  pub(crate) fn read_numeric_key(&self, key: &mut SmcKey) -> WithError<f32> {
+    let info = match key.info {
+      Some(info) => info,
+      None => {
+        let request = KeyData { data8: 9, key: key.key, ..Default::default() };
+        let info = self.read(&request)?.key_info;
+        key.info = Some(info);
+        info
+      }
+    };
+    let request = KeyData { data8: 5, key: key.key, key_info: info, ..Default::default() };
+    let value = self.read(&request)?;
+    let data = value.bytes.get(..info.data_size as usize).ok_or("Invalid SMC value size")?;
+    let unit = info.data_type.to_be_bytes();
+    let unit = std::str::from_utf8(&unit).map_err(|_| "Invalid SMC value type")?;
+    Self::decode_numeric_value(data, unit)
+      .ok_or_else(|| format!("Unsupported numeric SMC value ({unit})").into())
   }
 
   fn decode_numeric_value(data: &[u8], unit: &str) -> Option<f32> {

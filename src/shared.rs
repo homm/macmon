@@ -24,8 +24,12 @@ pub struct FanMetric {
 
 /// Average of the valid sensor readings, or None when no sensor has one.
 pub(crate) fn temperature_average(values: &[f32]) -> Option<f32> {
-  let valid: Vec<f32> = values.iter().copied().filter(|&val| val > 0.0 && val <= 150.0).collect();
-  (!valid.is_empty()).then(|| valid.iter().sum::<f32>() / valid.len() as f32)
+  let (sum, count) = values
+    .iter()
+    .copied()
+    .filter(|&val| val > 0.0 && val <= 150.0)
+    .fold((0.0, 0), |(sum, count), value| (sum + value, count + 1));
+  (count > 0).then(|| sum / count as f32)
 }
 
 pub(crate) fn zero_div<T: core::ops::Div<Output = T> + Default + PartialEq>(a: T, b: T) -> T {

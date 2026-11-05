@@ -2,8 +2,8 @@
 
 use std::time::{Duration, Instant};
 
-use crate::shared::{FanMetric, TempMetrics, temperature_average};
-use crate::sources::{SMC, WithError, sysctl_str};
+use crate::shared::{FanMetric, TempMetrics};
+use crate::sources::{SMC, SmcKey, WithError, sysctl_str};
 
 // CPU/GPU temperature keys adapted from exelban/stats, Modules/Sensors/values.swift.
 // Retrieved 2026-11-05. Copyright (c) 2019, 2020 Serhiy Mytrovtsiy.
@@ -78,9 +78,10 @@ pub struct SmcMetrics {
 /// Selects SMC sensors, computes metrics, and caches complete snapshots.
 pub struct SmcSampler {
   smc: Option<SMC>,
-  cpu_keys: Vec<String>,
-  gpu_keys: Vec<String>,
-  fan_keys: Vec<String>,
+  cpu_keys: Vec<SmcKey>,
+  gpu_keys: Vec<SmcKey>,
+  fan_keys: Vec<(SmcKey, SmcKey)>,
+  power_key: SmcKey,
   cache_duration: Duration,
   cached: Option<(Instant, SmcMetrics)>,
 }
@@ -93,15 +94,17 @@ impl SmcSampler {
       cpu_keys: Vec::new(),
       gpu_keys: Vec::new(),
       fan_keys: Vec::new(),
+      power_key: SmcKey::new("PSTR")?,
       cache_duration: cache_duration.unwrap_or(Duration::from_secs(1)),
       cached: None,
     };
     if let Some(smc) = result.smc.as_mut() {
       let chip = sysctl_str("machdep.cpu.brand_string").unwrap_or_default();
       let keys = temperature_keys(&chip);
+      let mut fan_names = Vec::new();
       for name in smc.read_all_keys().unwrap_or_default() {
         if name.len() == 4 && name.starts_with('F') && name.ends_with("Ac") {
-          result.fan_keys.push(name);
+          fan_names.push(name);
           continue;
         }
         let (is_cpu, is_gpu) = match keys {
@@ -118,15 +121,19 @@ impl SmcSampler {
           continue;
         }
         if is_cpu {
-          result.cpu_keys.push(name);
+          result.cpu_keys.push(smc.prepare_key(&name)?);
         } else {
-          result.gpu_keys.push(name);
+          result.gpu_keys.push(smc.prepare_key(&name)?);
         }
       }
+      // Stable fan order, with duplicate keys adjacent for deduplication.
+      fan_names.sort();
+      fan_names.dedup();
+      for name in fan_names {
+        let max_name = format!("{}Mx", &name[..2]);
+        result.fan_keys.push((SmcKey::new(&name)?, SmcKey::new(&max_name)?));
+      }
     }
-    // Stable fan order, with duplicate keys adjacent for deduplication.
-    result.fan_keys.sort();
-    result.fan_keys.dedup();
     Ok(result)
   }
 
@@ -146,7 +153,7 @@ impl SmcSampler {
     }
     let temp = if self.cpu_keys.is_empty() { None } else { Some(self.get_temp_smc()?) };
     let fans = self.get_fans();
-    let sys_power = self.smc.as_mut().and_then(|smc| smc.read_float_val("PSTR").ok());
+    let sys_power = self.smc.as_ref().and_then(|smc| smc.read_float_key(&mut self.power_key).ok());
     let metrics = SmcMetrics { temp, fans, sys_power };
     if !self.cache_duration.is_zero() {
       self.cached = Some((Instant::now(), metrics.clone()));
@@ -156,34 +163,33 @@ impl SmcSampler {
 
   pub fn get_temp_smc(&mut self) -> WithError<TempMetrics> {
     let smc = self.smc.as_mut().ok_or("SMC unavailable")?;
-    let mut cpu_metrics = Vec::new();
-    for sensor in &self.cpu_keys {
-      cpu_metrics.push(smc.read_float_val(sensor)?);
+    let mut averages = [None; 2];
+    for (keys, average) in [&mut self.cpu_keys, &mut self.gpu_keys].into_iter().zip(&mut averages) {
+      let mut sum = 0.0;
+      let mut count = 0;
+      for key in keys {
+        let value = smc.read_float_key(key)?;
+        if value > 0.0 && value <= 150.0 {
+          sum += value;
+          count += 1;
+        }
+      }
+      *average = (count > 0).then(|| sum / count as f32);
     }
-    let mut gpu_metrics = Vec::new();
-    for sensor in &self.gpu_keys {
-      gpu_metrics.push(smc.read_float_val(sensor)?);
-    }
-    Ok(TempMetrics {
-      cpu_temp_avg: temperature_average(&cpu_metrics),
-      gpu_temp_avg: temperature_average(&gpu_metrics),
-    })
+    Ok(TempMetrics { cpu_temp_avg: averages[0], gpu_temp_avg: averages[1] })
   }
 
   fn get_fans(&mut self) -> Vec<FanMetric> {
     let mut fans = Vec::new();
     if let Some(smc) = self.smc.as_mut() {
-      let mut read_rpm = |key: &str| {
-        let value = smc.read_numeric_value(key).ok()?;
+      let read_rpm = |key: &mut SmcKey| {
+        let value = smc.read_numeric_key(key).ok()?;
         if (0.0..=100_000.0).contains(&value) { Some(value.trunc() as u32) } else { None }
       };
-      for (i, key) in self.fan_keys.iter().enumerate() {
+      for (i, (key, max_key)) in self.fan_keys.iter_mut().enumerate() {
         if let Some(rpm) = read_rpm(key) {
           let name = format!("fan{i}");
-          let max_rpm = match key.strip_suffix("Ac") {
-            Some(prefix) => read_rpm(&format!("{prefix}Mx")).filter(|rpm| *rpm > 0),
-            None => None,
-          };
+          let max_rpm = read_rpm(max_key).filter(|rpm| *rpm > 0);
           fans.push(FanMetric { name, rpm, max_rpm });
         }
       }
@@ -217,6 +223,7 @@ pub(crate) mod tests {
       cpu_keys: Vec::new(),
       gpu_keys: Vec::new(),
       fan_keys: Vec::new(),
+      power_key: SmcKey::new("PSTR").unwrap(),
       cache_duration: Duration::from_secs(1),
       cached: None,
     }
@@ -254,7 +261,7 @@ pub(crate) mod tests {
   #[test]
   fn temperatures_require_cpu_sensors_even_when_gpu_sensors_exist() {
     let mut smc = without_sources();
-    smc.gpu_keys.push("Tg01".into());
+    smc.gpu_keys.push(SmcKey::new("Tg01").unwrap());
     for _ in 0..2 {
       assert!(smc.get_metrics().unwrap().temp.is_none());
     }
@@ -290,7 +297,7 @@ pub(crate) mod tests {
     let mut smc = without_sources();
     let sampled_at = Instant::now() - Duration::from_secs(2);
     smc.cached = Some((sampled_at, SmcMetrics::default()));
-    smc.cpu_keys.push("Tp01".into());
+    smc.cpu_keys.push(SmcKey::new("Tp01").unwrap());
     for _ in 0..2 {
       assert!(smc.get_metrics().is_err());
       assert_eq!(smc.cached.as_ref().unwrap().0, sampled_at);
