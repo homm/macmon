@@ -3,7 +3,66 @@
 use std::time::{Duration, Instant};
 
 use crate::shared::{FanMetric, TempMetrics, temperature_average};
-use crate::sources::{SMC, WithError};
+use crate::sources::{SMC, WithError, sysctl_str};
+
+// CPU/GPU temperature keys adapted from exelban/stats, Modules/Sensors/values.swift.
+// Retrieved 2026-11-05. Copyright (c) 2019, 2020 Serhiy Mytrovtsiy.
+// Distributed under the MIT license included in LICENSE.
+fn temperature_keys(chip: &str) -> Option<(&'static [&'static str], &'static [&'static str])> {
+  match chip {
+    "Apple M1" | "Apple M1 Pro" | "Apple M1 Max" | "Apple M1 Ultra" => Some((
+      &["Tp09", "Tp0T", "Tp01", "Tp05", "Tp0D", "Tp0H", "Tp0L", "Tp0P", "Tp0X", "Tp0b"],
+      &["Tg05", "Tg0D", "Tg0L", "Tg0T"],
+    )),
+    "Apple M2" | "Apple M2 Pro" | "Apple M2 Max" | "Apple M2 Ultra" => Some((
+      &[
+        "Tp1h", "Tp1t", "Tp1p", "Tp1l", "Tp01", "Tp05", "Tp09", "Tp0D", "Tp0X", "Tp0b", "Tp0f",
+        "Tp0j",
+      ],
+      &["Tg0f", "Tg0j"],
+    )),
+    "Apple M3" | "Apple M3 Pro" | "Apple M3 Max" | "Apple M3 Ultra" => Some((
+      &[
+        "Te05", "Te0L", "Te0P", "Te0S", "Tf04", "Tf09", "Tf0A", "Tf0B", "Tf0D", "Tf0E", "Tf44",
+        "Tf49", "Tf4A", "Tf4B", "Tf4D", "Tf4E",
+      ],
+      &["Tf14", "Tf18", "Tf19", "Tf1A", "Tf24", "Tf28", "Tf29", "Tf2A"],
+    )),
+    "Apple M4" => Some((
+      &[
+        "Te05", "Te0S", "Te09", "Te0H", "Tp01", "Tp05", "Tp09", "Tp0D", "Tp0V", "Tp0Y", "Tp0b",
+        "Tp0e",
+      ],
+      &["Tg0G", "Tg0H", "Tg0K", "Tg0L", "Tg0d", "Tg0e", "Tg0j", "Tg0k"],
+    )),
+    "Apple M4 Pro" | "Apple M4 Max" => Some((
+      &[
+        "Te05", "Te0S", "Te09", "Te0H", "Tp01", "Tp05", "Tp09", "Tp0D", "Tp0V", "Tp0Y", "Tp0b",
+        "Tp0e",
+      ],
+      &["Tg1U", "Tg1k", "Tg0K", "Tg0L", "Tg0d", "Tg0e", "Tg0j", "Tg0k"],
+    )),
+    "Apple M5" | "Apple M5 Pro" | "Apple M5 Max" | "Apple M5 Ultra" => Some((
+      &[
+        "Tp00", "Tp04", "Tp08", "Tp0C", "Tp0G", "Tp0K", "Tp0O", "Tp0R", "Tp0U", "Tp0X", "Tp0a",
+        "Tp0d", "Tp0g", "Tp0j", "Tp0m", "Tp0p", "Tp0u", "Tp0y",
+      ],
+      &["Tg0U", "Tg0X", "Tg0d", "Tg0g", "Tg0j", "Tg1Y", "Tg1c", "Tg1g"],
+    )),
+    "Apple M6" | "Apple M6 Pro" | "Apple M6 Max" => Some((
+      &[
+        "Tp0j", "Tp0g", "Tp09", "Tp07", "Tp0m", "Tp0L", "Tp0I", "Tp0d", "Tp0E", "Tp0G", "Tp0b",
+        "Tp05", "Te07", "Te08", "Te09", "Te0c", "Te0h", "Te0i",
+      ],
+      &[
+        "Tg1e", "Tg0d", "Tg0c", "Tg0b", "Tg1c", "Tg1d", "Tg07", "Tg1f", "Tg09", "Tg0a", "Tg1g",
+        "Tg1h",
+      ],
+    )),
+    "Apple A18 Pro" => Some((&["Te05", "Te0S", "Tp05", "Tp0D"], &["Tg05", "Tg0D", "Tg0L", "Tg0e"])),
+    _ => None,
+  }
+}
 
 /// One snapshot of the SMC metrics used by the sampler.
 #[derive(Debug, Default, Clone)]
@@ -38,14 +97,20 @@ impl SmcSampler {
       cached: None,
     };
     if let Some(smc) = result.smc.as_mut() {
+      let chip = sysctl_str("machdep.cpu.brand_string").unwrap_or_default();
+      let keys = temperature_keys(&chip);
       for name in smc.read_all_keys().unwrap_or_default() {
         if name.len() == 4 && name.starts_with('F') && name.ends_with("Ac") {
           result.fan_keys.push(name);
           continue;
         }
-        // Exact sensor assignments are undocumented; retain the existing CPU/GPU prefixes.
-        let is_cpu = name.starts_with("Tp") || name.starts_with("Te") || name.starts_with("Ts");
-        let is_gpu = name.starts_with("Tg");
+        let (is_cpu, is_gpu) = match keys {
+          Some((cpu, gpu)) => (cpu.contains(&name.as_str()), gpu.contains(&name.as_str())),
+          None => (
+            name.starts_with("Tp") || name.starts_with("Te") || name.starts_with("Ts"),
+            name.starts_with("Tg"),
+          ),
+        };
         if !is_cpu && !is_gpu {
           continue;
         }
@@ -130,6 +195,21 @@ impl SmcSampler {
 #[cfg(test)]
 pub(crate) mod tests {
   use super::*;
+
+  #[test]
+  fn temperature_tables_distinguish_m4_variants_and_unknown_chips() {
+    let (cpu, gpu) = temperature_keys("Apple M4 Pro").unwrap();
+    assert!(cpu.contains(&"Te05") && cpu.contains(&"Tp0e"));
+    assert!(gpu.contains(&"Tg1U") && gpu.contains(&"Tg1k"));
+    assert!(!gpu.contains(&"Tg0G") && !gpu.contains(&"Tg0H"));
+    let (_, base_gpu) = temperature_keys("Apple M4").unwrap();
+    assert!(base_gpu.contains(&"Tg0G") && !base_gpu.contains(&"Tg1U"));
+    let (cpu, gpu) = temperature_keys("Apple M3 Ultra").unwrap();
+    assert!(cpu.contains(&"Tf4E") && gpu.contains(&"Tf2A"));
+    for chip in ["Apple M4 Ultra", "Apple M10", "Apple M7", "", "Virtual CPU"] {
+      assert!(temperature_keys(chip).is_none(), "{chip}");
+    }
+  }
 
   pub(crate) fn without_sources() -> SmcSampler {
     SmcSampler {
