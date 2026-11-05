@@ -82,8 +82,8 @@ pub fn cfstr(val: &str) -> CFStringRef {
 /// Convert a CoreFoundation string reference into a Rust `String`.
 pub fn from_cfstr(val: CFStringRef) -> String {
   unsafe {
-    let mut buf = Vec::with_capacity(128);
-    if CFStringGetCString(val, buf.as_mut_ptr(), 128, kCFStringEncodingUTF8) == 0 {
+    let mut buf = [0; 128];
+    if CFStringGetCString(val, buf.as_mut_ptr(), buf.len() as isize, kCFStringEncodingUTF8) == 0 {
       panic!("Failed to convert CFString to CString");
     }
     std::ffi::CStr::from_ptr(buf.as_ptr()).to_string_lossy().to_string()
@@ -1459,6 +1459,18 @@ pub struct SensorVal {
 
 // MARK: SMC
 
+/// A key and its lazily loaded metadata, retained between reads on one SMC connection.
+pub(crate) struct SmcKey {
+  key: u32,
+  info: Option<KeyInfo>,
+}
+
+impl SmcKey {
+  pub(crate) fn new(name: &str) -> WithError<Self> {
+    Ok(Self { key: SMC::parse_key(name)?, info: None })
+  }
+}
+
 #[allow(clippy::upper_case_acronyms)]
 /// Apple System Management Controller connection.
 pub struct SMC {
@@ -1562,6 +1574,55 @@ impl SMC {
     })
   }
 
+  /// Read an SMC value in one of the supported numeric formats.
+  pub fn read_numeric_value(&mut self, key: &str) -> WithError<f32> {
+    let mut key = SmcKey { key: Self::parse_key(key)?, info: Some(self.read_key_info(key)?) };
+    self.read_numeric_key(&mut key)
+  }
+
+  pub(crate) fn prepare_key(&mut self, name: &str) -> WithError<SmcKey> {
+    Ok(SmcKey { key: Self::parse_key(name)?, info: Some(self.read_key_info(name)?) })
+  }
+
+  pub(crate) fn read_float_key(&self, key: &mut SmcKey) -> WithError<f32> {
+    let value = self.read_numeric_key(key)?;
+    let info = key.info.ok_or("SMC metadata unavailable")?;
+    if info.data_type != u32::from_be_bytes(*b"flt ") || info.data_size != 4 {
+      return Err("SMC key is not a 4-byte float".into());
+    }
+    Ok(value)
+  }
+
+  pub(crate) fn read_numeric_key(&self, key: &mut SmcKey) -> WithError<f32> {
+    let info = match key.info {
+      Some(info) => info,
+      None => {
+        let request = KeyData { data8: 9, key: key.key, ..Default::default() };
+        let info = self.read(&request)?.key_info;
+        key.info = Some(info);
+        info
+      }
+    };
+    let request = KeyData { data8: 5, key: key.key, key_info: info, ..Default::default() };
+    let value = self.read(&request)?;
+    let data = value.bytes.get(..info.data_size as usize).ok_or("Invalid SMC value size")?;
+    let unit = info.data_type.to_be_bytes();
+    let unit = std::str::from_utf8(&unit).map_err(|_| "Invalid SMC value type")?;
+    Self::decode_numeric_value(data, unit)
+      .ok_or_else(|| format!("Unsupported numeric SMC value ({unit})").into())
+  }
+
+  fn decode_numeric_value(data: &[u8], unit: &str) -> Option<f32> {
+    match unit {
+      "flt " if data.len() == 4 => Some(f32::from_le_bytes(data.try_into().ok()?)),
+      "fpe2" if data.len() >= 2 => Some(((data[0] as u16) << 6 | ((data[1] as u16) >> 2)) as f32),
+      "ui8 " if !data.is_empty() => Some(data[0] as f32),
+      "ui16" if data.len() >= 2 => Some(u16::from_be_bytes(data[0..2].try_into().ok()?) as f32),
+      "ui32" if data.len() >= 4 => Some(u32::from_be_bytes(data[0..4].try_into().ok()?) as f32),
+      _ => None,
+    }
+  }
+
   /// Read a four-byte float SMC value.
   pub fn read_float_val(&mut self, key: &str) -> WithError<f32> {
     const FLOAT_TYPE: u32 = 1718383648; // FourCC: "flt "
@@ -1620,6 +1681,14 @@ impl Drop for SMC {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn parse_smc_numeric_values() {
+    assert_eq!(SMC::decode_numeric_value(&42.5f32.to_le_bytes(), "flt "), Some(42.5));
+    assert_eq!(SMC::decode_numeric_value(&[0x13, 0x88], "fpe2"), Some(1250.0));
+    assert_eq!(SMC::decode_numeric_value(&[0x04, 0xd2], "ui16"), Some(1234.0));
+    assert_eq!(SMC::decode_numeric_value(&[0x00, 0x00, 0x04, 0xd2], "ui32"), Some(1234.0));
+  }
 
   #[test]
   fn sample_duration_follows_external_waits_resets_and_consecutive_calls() {

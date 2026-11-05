@@ -23,7 +23,7 @@ build:
 update:
 	cargo upgrade -i
 
-.PHONY: loc bench remote xcframework
+.PHONY: loc bench benchmarks remote xcframework
 
 xcframework:
 	cargo build --lib --no-default-features $(CARGO_FLAGS)
@@ -32,6 +32,9 @@ xcframework:
 		-library "$(CURDIR)/target/release/libmacmon.dylib" \
 		-headers "$(CURDIR)/include" \
 		-output "$(CURDIR)/dist/CMacmon.xcframework"
+
+benchmarks: # measure sampling overhead; BENCH=smc selects a benchmark group
+	cargo bench --locked --no-default-features --features bench --bench bench -- $(BENCH)
 
 loc: # production lines, tests excluded; REF=origin/main compares with a git ref
 	@python3 scripts/loc.py $(REF)

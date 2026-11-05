@@ -1,4 +1,36 @@
-//! Shared library helpers.
+//! Shared metric types and library helpers.
+
+use serde::Serialize;
+
+/// Average hardware temperatures.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct TempMetrics {
+  /// Average CPU temperature in Celsius, or None when unavailable.
+  pub cpu_temp_avg: Option<f32>,
+  /// Average GPU temperature in Celsius, or None when unavailable.
+  pub gpu_temp_avg: Option<f32>,
+}
+
+/// Fan speed metrics.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct FanMetric {
+  /// Stable fan name derived from the fan order, e.g. `fan0`.
+  pub name: String,
+  /// Current fan speed in revolutions per minute.
+  pub rpm: u32,
+  /// Maximum fan speed in revolutions per minute, when reported by SMC.
+  pub max_rpm: Option<u32>,
+}
+
+/// Average of the valid sensor readings, or None when no sensor has one.
+pub(crate) fn temperature_average(values: &[f32]) -> Option<f32> {
+  let (sum, count) = values
+    .iter()
+    .copied()
+    .filter(|&val| val > 0.0 && val <= 150.0)
+    .fold((0.0, 0), |(sum, count), value| (sum + value, count + 1));
+  (count > 0).then(|| sum / count as f32)
+}
 
 pub(crate) fn zero_div<T: core::ops::Div<Output = T> + Default + PartialEq>(a: T, b: T) -> T {
   let zero: T = Default::default();
@@ -60,12 +92,19 @@ pub(crate) fn ioreport_channels_filter(
     return subgroup == "CPU Core Performance States";
   }
 
-  group == "GPU Stats" && subgroup == "GPU Performance States"
+  group == "GPU Stats" && subgroup == "GPU Performance States" && channel == "GPUPH"
 }
 
 #[cfg(test)]
 mod tests {
   use super::ioreport_channels_filter;
+
+  #[test]
+  fn subscribes_only_to_gpu_frequency_residencies() {
+    assert!(ioreport_channels_filter("GPU Stats", "GPU Performance States", "GPUPH", ""));
+    assert!(!ioreport_channels_filter("GPU Stats", "GPU Performance States", "OTHER", ""));
+    assert!(!ioreport_channels_filter("GPU Stats", "Other States", "GPUPH", ""));
+  }
 
   #[test]
   fn subscribes_only_to_known_clpc_energy_counters() {

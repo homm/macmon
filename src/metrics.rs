@@ -6,11 +6,14 @@ use std::time::Duration;
 use core_foundation::dictionary::CFDictionaryRef;
 use serde::Serialize;
 
+pub use crate::shared::{FanMetric, TempMetrics};
 use crate::shared::{
-  ioreport_channels_filter, is_clpc_energy_channel, is_pmp_ane_channel, zero_div,
+  ioreport_channels_filter, is_clpc_energy_channel, is_pmp_ane_channel, temperature_average,
+  zero_div,
 };
+use crate::smc_sampler::SmcSampler;
 use crate::sources::{
-  IOHIDSensors, IOReport, IOReportIteratorItem, SMC, SocInfo, cfio_get_residencies, cfio_watts,
+  IOHIDSensors, IOReport, IOReportIteratorItem, SocInfo, cfio_get_residencies, cfio_watts,
   cpu_load_ticks, get_soc_info, libc_ram, libc_swap,
 };
 
@@ -55,15 +58,6 @@ impl PowerSources {
 
 // MARK: Structs
 
-/// Average hardware temperatures.
-#[derive(Debug, Default, Serialize)]
-pub struct TempMetrics {
-  /// Average CPU temperature in Celsius, or None when unavailable.
-  pub cpu_temp_avg: Option<f32>,
-  /// Average GPU temperature in Celsius, or None when unavailable.
-  pub gpu_temp_avg: Option<f32>,
-}
-
 /// Memory and swap usage.
 #[derive(Debug, Default, Serialize)]
 pub struct MemMetrics {
@@ -75,17 +69,6 @@ pub struct MemMetrics {
   pub swap_total: u64,
   /// Used swap in bytes.
   pub swap_usage: u64,
-}
-
-/// Fan speed metrics.
-#[derive(Debug, Default, Serialize)]
-pub struct FanMetric {
-  /// Stable fan name derived from the fan order, e.g. `fan0`.
-  pub name: String,
-  /// Current fan speed in revolutions per minute.
-  pub rpm: u32,
-  /// Maximum fan speed in revolutions per minute, when reported by SMC.
-  pub max_rpm: Option<u32>,
 }
 
 /// Metrics for one CPU core.
@@ -117,14 +100,6 @@ pub struct CpuTierMetrics {
   pub active_ratio: f32,
   /// Metrics for each core, ordered by die and core index.
   pub cores: Vec<CpuCoreMetrics>,
-}
-
-#[derive(Default)]
-struct SmcSensors {
-  smc: Option<SMC>,
-  cpu_keys: Vec<String>,
-  gpu_keys: Vec<String>,
-  fan_keys: Vec<String>,
 }
 
 /// A complete metrics snapshot returned by [`Sampler`].
@@ -215,24 +190,6 @@ pub struct Metrics {
 
 // MARK: Helpers
 
-fn is_valid_temp(val: f32) -> bool {
-  val > 0.0 && val <= 150.0
-}
-
-/// Average of the valid sensor readings, or None when no sensor has one.
-fn temperature_average(values: &[f32]) -> Option<f32> {
-  let valid: Vec<f32> = values.iter().copied().filter(|&val| is_valid_temp(val)).collect();
-  (!valid.is_empty()).then(|| valid.iter().sum::<f32>() / valid.len() as f32)
-}
-
-fn is_valid_fan_rpm(val: f32) -> bool {
-  (0.0..=100_000.0).contains(&val)
-}
-
-fn fan_rpm_value(val: f32) -> Option<u32> {
-  if is_valid_fan_rpm(val) { Some(val.trunc() as u32) } else { None }
-}
-
 fn aggregate_frequency(cores: &[CpuCoreMetrics], min_frequency_mhz: u32) -> u32 {
   let average =
     zero_div(cores.iter().map(|core| core.freq_mhz as f64).sum::<f64>(), cores.len() as f64);
@@ -279,23 +236,6 @@ impl Metrics {
   }
 }
 
-fn smc_numeric_value(data: &[u8], unit: &str) -> Option<f32> {
-  match unit {
-    "flt " if data.len() == 4 => Some(f32::from_le_bytes(data.try_into().ok()?)),
-    "fpe2" if data.len() >= 2 => Some(((data[0] as u16) << 6 | ((data[1] as u16) >> 2)) as f32),
-    "ui8 " if !data.is_empty() => Some(data[0] as f32),
-    "ui16" if data.len() >= 2 => Some(u16::from_be_bytes(data[0..2].try_into().ok()?) as f32),
-    "ui32" if data.len() >= 4 => Some(u32::from_be_bytes(data[0..4].try_into().ok()?) as f32),
-    _ => None,
-  }
-}
-
-fn read_smc_numeric_u32(smc: &mut SMC, key: &str) -> Option<u32> {
-  let val = smc.read_val(key).ok()?;
-  let val = smc_numeric_value(&val.data, &val.unit)?;
-  fan_rpm_value(val)
-}
-
 fn calc_freq_from_residencies(items: &[(String, i64)], freqs: &[u32]) -> FreqMetrics {
   let (len1, len2) = (items.len(), freqs.len());
   assert!(len1 > len2, "calc_freq invalid data: {len1} vs {len2}"); // todo?
@@ -310,11 +250,11 @@ fn calc_freq_from_residencies(items: &[(String, i64)], freqs: &[u32]) -> FreqMet
   let usage = items.iter().skip(offset).take(freqs.len()).map(|x| x.1 as f64).sum::<f64>();
   let total = items.iter().map(|x| x.1 as f64).sum::<f64>();
 
-  let mut avg_freq = 0f64;
+  let mut weighted_freq = 0f64;
   for i in 0..freqs.len() {
-    let percent = zero_div(items[i + offset].1 as _, usage);
-    avg_freq += percent * freqs[i] as f64;
+    weighted_freq += items[i + offset].1 as f64 * freqs[i] as f64;
   }
+  let avg_freq = zero_div(weighted_freq, usage);
 
   let active_ratio = zero_div(usage, total);
   let min_freq = *freqs.first().unwrap() as f64;
@@ -399,27 +339,44 @@ fn freqs_fit(residencies: &[(String, i64)], freqs: &[u32]) -> bool {
   !freqs.is_empty() && residencies.len() > freqs.len() && states >= freqs.len()
 }
 
+/// Cached channel classification and output ordering for one sampler's fixed CPU tiers.
+#[derive(Default)]
+struct CpuTopology {
+  channels: HashMap<CpuCoreKey, Option<usize>>,
+  tiers: Vec<Vec<(CpuCoreKey, usize, usize)>>,
+}
+
 /// Per-core metrics of the tiers of `SocInfo::cpu_tiers`, keyed by IOReport channel.
 struct CpuTierCores<'a> {
   soc: &'a SocInfo,
+  topology: &'a mut CpuTopology,
   tiers: Vec<HashMap<CpuCoreKey, FreqMetrics>>,
 }
 
 impl<'a> CpuTierCores<'a> {
-  fn new(soc: &'a SocInfo) -> Self {
-    Self { soc, tiers: vec![HashMap::new(); soc.cpu_tiers.len()] }
+  fn new(soc: &'a SocInfo, topology: &'a mut CpuTopology) -> Self {
+    topology.tiers.resize_with(soc.cpu_tiers.len(), Vec::new);
+    Self { soc, topology, tiers: vec![HashMap::new(); soc.cpu_tiers.len()] }
   }
 
   /// Adds the core of a "CPU Core Performance States" `channel` from its state residencies, or
   /// returns false when the channel is not a CPU core.
   fn add(&mut self, channel: &str, residencies: &[(String, i64)]) -> bool {
-    let Some((kind, key)) = parse_cpu_core_channel(channel) else { return false };
-    let Some(i) = cpu_tier_index(kind, self.tiers.len()) else { return false };
+    let tier = match self.topology.channels.get(channel) {
+      Some(tier) => *tier,
+      None => {
+        let tier = parse_cpu_core_channel(channel)
+          .and_then(|(kind, _)| cpu_tier_index(kind, self.tiers.len()));
+        self.topology.channels.insert(channel.to_owned(), tier);
+        tier
+      }
+    };
+    let Some(i) = tier else { return false };
     // A table with more frequencies than the core has states belongs to another complex (say a
     // future middle tier with its own); leave the core out instead of aborting on it.
     let freqs = &self.soc.cpu_tiers[i].freqs;
     if freqs_fit(residencies, freqs) {
-      self.tiers[i].insert(key, calc_freq_from_residencies(residencies, freqs));
+      self.tiers[i].insert(channel.to_owned(), calc_freq_from_residencies(residencies, freqs));
     }
     true
   }
@@ -427,36 +384,50 @@ impl<'a> CpuTierCores<'a> {
   /// Tiers with their cores; `aggregate_ioreport_metrics` fills in the tier values.
   fn into_metrics(self) -> Vec<CpuTierMetrics> {
     let labels = self.soc.cpu_tiers.iter().map(|tier| tier.label.clone());
-    let tier = |(label, cores)| CpuTierMetrics {
+    let tier = |((label, cores), topology): (_, &mut Vec<_>)| CpuTierMetrics {
       label,
-      cores: collect_cpu_core_metrics(cores),
+      cores: collect_cpu_core_metrics(cores, topology),
       ..Default::default()
     };
-    labels.zip(self.tiers).map(tier).collect()
+    labels.zip(self.tiers).zip(&mut self.topology.tiers).map(tier).collect()
   }
 }
 
-fn collect_cpu_core_metrics(metrics: HashMap<CpuCoreKey, FreqMetrics>) -> Vec<CpuCoreMetrics> {
-  let mut metrics: Vec<_> = metrics.into_iter().collect();
-  metrics.sort_by_key(|(channel, _)| cpu_core_sort_key(channel));
-  let mut next_clustered_core_id = HashMap::<usize, usize>::new();
+fn collect_cpu_core_metrics(
+  metrics: HashMap<CpuCoreKey, FreqMetrics>,
+  topology: &mut Vec<(CpuCoreKey, usize, usize)>,
+) -> Vec<CpuCoreMetrics> {
+  // Rebuild only when the observed set changes, preserving dense Ultra IDs when cores disappear.
+  if topology.len() != metrics.len()
+    || topology.iter().any(|(key, _, _)| !metrics.contains_key(key))
+  {
+    let mut channels: Vec<_> = metrics.keys().cloned().collect();
+    channels.sort_by_key(|channel| cpu_core_sort_key(channel));
+    let mut next_clustered_core_id = HashMap::<usize, usize>::new();
+    *topology = channels
+      .into_iter()
+      .map(|channel| {
+        let die_id = parse_die_id(&channel);
+        let core_id = if channel.contains("_CPU") {
+          let next = next_clustered_core_id.entry(die_id).or_default();
+          let core_id = *next;
+          *next += 1;
+          core_id
+        } else {
+          cpu_core_prefix(&channel)
+            .and_then(|prefix| parse_cpu_core_id(&channel, prefix))
+            .unwrap_or_default()
+        };
 
-  metrics
-    .into_iter()
-    .map(|(channel, (freq_mhz, scaled_ratio, active_ratio))| {
-      let die_id = parse_die_id(&channel);
-      let core_id = if channel.contains("_CPU") {
-        let next = next_clustered_core_id.entry(die_id).or_default();
-        let core_id = *next;
-        *next += 1;
-        core_id
-      } else {
-        cpu_core_prefix(&channel)
-          .and_then(|prefix| parse_cpu_core_id(&channel, prefix))
-          .unwrap_or_default()
-      };
-
-      CpuCoreMetrics { die_id, core_id, freq_mhz, scaled_ratio, active_ratio }
+        (channel, die_id, core_id)
+      })
+      .collect();
+  }
+  topology
+    .iter()
+    .map(|(channel, die_id, core_id)| {
+      let (freq_mhz, scaled_ratio, active_ratio) = metrics[channel];
+      CpuCoreMetrics { die_id: *die_id, core_id: *core_id, freq_mhz, scaled_ratio, active_ratio }
     })
     .collect()
 }
@@ -481,46 +452,18 @@ fn uses_cpu_ticks(soc: &SocInfo, cpu_stats: bool) -> bool {
   soc.cpu_tiers.len() == 1 && !(cpu_stats && freqs)
 }
 
-fn init_smc() -> WithError<SmcSensors> {
-  let Some(mut smc) = SMC::open()? else { return Ok(SmcSensors::default()) };
+#[cfg(feature = "bench")]
+#[doc(hidden)]
+pub mod bench {
+  use super::*;
 
-  let mut cpu_sensors = Vec::new();
-  let mut gpu_sensors = Vec::new();
-  let mut fan_sensors = Vec::new();
-
-  let names = smc.read_all_keys().unwrap_or(vec![]);
-  for name in &names {
-    if name.len() == 4 && name.starts_with('F') && name.ends_with("Ac") {
-      fan_sensors.push(name.clone());
-      continue;
-    }
-    // Unfortunately, it is not known which keys are responsible for what.
-    // Basically in the code that can be found publicly "Tp" is used for CPU and "Tg" for GPU.
-
-    let is_cpu = name.starts_with("Tp") || name.starts_with("Te") || name.starts_with("Ts");
-    let is_gpu = name.starts_with("Tg");
-    if !is_cpu && !is_gpu {
-      continue;
-    }
-
-    if smc.read_float_val(name).is_err() {
-      continue;
-    }
-
-    if is_cpu {
-      cpu_sensors.push(name.clone());
-    } else if is_gpu {
-      gpu_sensors.push(name.clone());
-    }
+  pub fn init_ioreport() -> WithError<IOReport> {
+    IOReport::with_filter(Some(ioreport_channels_filter))?.ok_or("no IOReport channels".into())
   }
 
-  // Sort first so fan order is stable and any duplicate keys become adjacent for dedup().
-  fan_sensors.sort();
-  fan_sensors.dedup();
-
-  // println!("{} {}", cpu_sensors.len(), gpu_sensors.len());
-  let (cpu_keys, gpu_keys, fan_keys) = (cpu_sensors, gpu_sensors, fan_sensors);
-  Ok(SmcSensors { smc: Some(smc), cpu_keys, gpu_keys, fan_keys })
+  pub fn get_sample(ior: &mut IOReport) -> (crate::sources::IOReportIterator, Duration) {
+    ior.get_sample()
+  }
 }
 
 // MARK: Sampler
@@ -539,11 +482,9 @@ pub struct Sampler {
   use_cpu_ticks: bool,
   /// CPU ticks at initialization or at the end of the last sample.
   cpu_ticks: Option<Vec<[u32; 4]>>,
+  cpu_topology: CpuTopology,
   hid: IOHIDSensors,
-  smc: Option<SMC>,
-  smc_cpu_keys: Vec<String>,
-  smc_gpu_keys: Vec<String>,
-  smc_fan_keys: Vec<String>,
+  smc: SmcSampler,
 }
 
 impl Sampler {
@@ -551,7 +492,7 @@ impl Sampler {
   pub fn new() -> WithError<Self> {
     let soc = get_soc_info()?;
     let hid = IOHIDSensors::new()?;
-    let smc_sensors = init_smc()?;
+    let smc = SmcSampler::new(None)?;
 
     // Capture the initial baselines after the other sources have been initialized.
     let ior = IOReport::with_filter(Some(ioreport_channels_filter))?;
@@ -565,11 +506,9 @@ impl Sampler {
       ior,
       use_cpu_ticks,
       cpu_ticks,
+      cpu_topology: CpuTopology::default(),
       hid,
-      smc: smc_sensors.smc,
-      smc_cpu_keys: smc_sensors.cpu_keys,
-      smc_gpu_keys: smc_sensors.gpu_keys,
-      smc_fan_keys: smc_sensors.fan_keys,
+      smc,
     })
   }
 
@@ -581,22 +520,9 @@ impl Sampler {
     Ok(sampler)
   }
 
-  fn get_temp_smc(&mut self) -> WithError<TempMetrics> {
-    let smc = self.smc.as_mut().ok_or("SMC unavailable")?;
-    let mut cpu_metrics = Vec::new();
-    for sensor in &self.smc_cpu_keys {
-      cpu_metrics.push(smc.read_float_val(sensor)?);
-    }
-
-    let mut gpu_metrics = Vec::new();
-    for sensor in &self.smc_gpu_keys {
-      gpu_metrics.push(smc.read_float_val(sensor)?);
-    }
-
-    let cpu_temp_avg = temperature_average(&cpu_metrics);
-    let gpu_temp_avg = temperature_average(&gpu_metrics);
-
-    Ok(TempMetrics { cpu_temp_avg, gpu_temp_avg })
+  /// Set the SMC snapshot lifetime (one second by default). Zero disables caching.
+  pub fn set_smc_cache_duration(&mut self, duration: Duration) {
+    self.smc.set_cache_duration(duration);
   }
 
   fn get_temp_hid(&mut self) -> WithError<TempMetrics> {
@@ -625,46 +551,18 @@ impl Sampler {
     Ok(TempMetrics { cpu_temp_avg, gpu_temp_avg })
   }
 
-  fn get_temp(&mut self) -> WithError<TempMetrics> {
-    // HID for M1, SMC for M2/M3
-    // UPD: Looks like HID/SMC related to OS version, not to the chip (SMC available from macOS 14)
-    match !self.smc_cpu_keys.is_empty() {
-      true => self.get_temp_smc(),
-      false => self.get_temp_hid(),
-    }
-  }
-
-  fn get_fans(&mut self) -> Vec<FanMetric> {
-    let mut fans = Vec::new();
-    let Some(smc) = self.smc.as_mut() else { return fans };
-    for (i, key) in self.smc_fan_keys.iter().enumerate() {
-      let Some(rpm) = read_smc_numeric_u32(smc, key) else { continue };
-      let name = format!("fan{i}");
-      let max_rpm = match key.strip_suffix("Ac") {
-        Some(prefix) => read_smc_numeric_u32(smc, &format!("{prefix}Mx")).filter(|rpm| *rpm > 0),
-        None => None,
-      };
-      fans.push(FanMetric { name, rpm, max_rpm });
-    }
-    fans
-  }
-
   fn get_mem(&mut self) -> WithError<MemMetrics> {
     let (ram_usage, ram_total) = libc_ram()?;
     let (swap_usage, swap_total) = libc_swap()?;
     Ok(MemMetrics { ram_total, ram_usage, swap_total, swap_usage })
   }
 
-  fn get_smc_power(&mut self, key: &str) -> Option<f32> {
-    self.smc.as_mut()?.read_float_val(key).ok().filter(|value| value.is_finite())
-  }
-
   fn get_ioreport_metrics(
-    &self,
+    &mut self,
     sample: impl IntoIterator<Item = IOReportIteratorItem>,
     dt: Duration,
   ) -> WithError<Metrics> {
-    let mut cpu_cores = CpuTierCores::new(&self.soc);
+    let mut cpu_cores = CpuTierCores::new(&self.soc, &mut self.cpu_topology);
     let mut rs = Metrics::default();
     let mut cpu_power = PowerSources::default();
     let mut gpu_power = PowerSources::default();
@@ -799,15 +697,16 @@ impl Sampler {
     let mut rs = aggregate_ioreport_metrics(rs, &self.soc);
 
     rs.memory = self.get_mem()?;
-    rs.temp = self.get_temp()?;
-    rs.fans = self.get_fans();
-
-    rs.sys_power = self.get_smc_power("PSTR").map_or(0.0, |val| val.max(rs.chip_power));
-    // Backlight sensor names used by different Apple Silicon generations.
-    rs.display_power =
-      self.get_smc_power("PBwo").or_else(|| self.get_smc_power("PDBR")).unwrap_or(0.0);
-    rs.battery_power = self.get_smc_power("PPBR").unwrap_or(0.0);
-    rs.dc_in_power = self.get_smc_power("PDTR").unwrap_or(0.0);
+    let smc = self.smc.get_metrics()?;
+    rs.temp = match smc.temp {
+      Some(temp) => temp,
+      None => self.get_temp_hid()?,
+    };
+    rs.fans = smc.fans;
+    rs.sys_power = smc.sys_power.map_or(0.0, |val| val.max(rs.chip_power));
+    rs.display_power = smc.display_power.unwrap_or(0.0);
+    rs.battery_power = smc.battery_power.unwrap_or(0.0);
+    rs.dc_in_power = smc.dc_in_power.unwrap_or(0.0);
 
     Ok(rs)
   }
@@ -829,9 +728,9 @@ mod tests {
   use core_foundation::string::CFString;
 
   use super::{
-    CpuCoreKind, CpuCoreMetrics, CpuTierCores, CpuTierMetrics, Metrics, PowerSources, Sampler,
-    TempMetrics, aggregate_ioreport_metrics, calc_freq_from_residencies, collect_cpu_core_metrics,
-    cpu_cores_from_ticks, parse_cpu_core_channel, smc_numeric_value, temperature_average,
+    CpuCoreKind, CpuCoreMetrics, CpuTierCores, CpuTierMetrics, CpuTopology, Metrics, PowerSources,
+    Sampler, TempMetrics, aggregate_ioreport_metrics, calc_freq_from_residencies,
+    collect_cpu_core_metrics, cpu_cores_from_ticks, parse_cpu_core_channel, temperature_average,
     uses_cpu_ticks,
   };
   use crate::sources::{
@@ -908,11 +807,9 @@ mod tests {
       ior: None,
       use_cpu_ticks: true,
       cpu_ticks: cpu_load_ticks(),
+      cpu_topology: CpuTopology::default(),
       hid: IOHIDSensors::new().unwrap(),
-      smc: None,
-      smc_cpu_keys: vec![],
-      smc_gpu_keys: vec![],
-      smc_fan_keys: vec![],
+      smc: crate::smc_sampler::tests::without_sources(),
     }
   }
 
@@ -1016,7 +913,7 @@ mod tests {
       ("CLPC", "ISP", "mJ", 3_000),
       ("CLPC", "GPU SRAM", "mJ", 250),
     ];
-    let sampler = sampler_without_sources(4, false);
+    let mut sampler = sampler_without_sources(4, false);
     for (
       count,
       package_delta,
@@ -1118,14 +1015,6 @@ mod tests {
   }
 
   #[test]
-  fn parse_smc_numeric_values() {
-    assert_eq!(smc_numeric_value(&42.5f32.to_le_bytes(), "flt "), Some(42.5));
-    assert_eq!(smc_numeric_value(&[0x13, 0x88], "fpe2"), Some(1250.0));
-    assert_eq!(smc_numeric_value(&[0x04, 0xd2], "ui16"), Some(1234.0));
-    assert_eq!(smc_numeric_value(&[0x00, 0x00, 0x04, 0xd2], "ui32"), Some(1234.0));
-  }
-
-  #[test]
   #[allow(deprecated)]
   fn aggregates_ioreport_metrics() {
     let rs = aggregate_ioreport_metrics(
@@ -1219,7 +1108,8 @@ mod tests {
   #[test]
   fn routes_core_channels_to_the_lowest_and_highest_tier() {
     let soc = soc_info(1, 1);
-    let mut cores = CpuTierCores::new(&soc);
+    let mut topology = CpuTopology::default();
+    let mut cores = CpuTierCores::new(&soc, &mut topology);
     let busy = [("IDLE".to_string(), 50), ("V0P0".to_string(), 50)];
     // ECPU, and MCPU of M5 Pro/Max, go to the lowest tier; PCPU, also on Ultra, to the highest
     for channel in ["ECPU0", "MCPU3", "PCPU0", "DIE_1_PCPU1_CPU0"] {
@@ -1279,7 +1169,8 @@ mod tests {
       ("PACC0_MCPU5", 20, 2497252, &[]),
     ];
     let soc = m6_soc();
-    let mut cores = CpuTierCores::new(&soc);
+    let mut topology = CpuTopology::default();
+    let mut cores = CpuTierCores::new(&soc, &mut topology);
     for (channel, states, idle, active) in channels {
       assert!(cores.add(channel, &residencies(states, idle, active)), "{channel}");
     }
@@ -1313,7 +1204,8 @@ mod tests {
   #[test]
   fn routes_mcpu_to_the_middle_of_three_tiers() {
     let soc = m6_soc();
-    let mut cores = CpuTierCores::new(&soc);
+    let mut topology = CpuTopology::default();
+    let mut cores = CpuTierCores::new(&soc, &mut topology);
     let busy = |states| residencies(states, 50, &[(0, 50)]);
     for (channel, states) in [("EACC_ECPU0", 7), ("PACC0_MCPU2", 20), ("PACC0_PCPU0", 20)] {
       assert!(cores.add(channel, &busy(states)), "{channel}");
@@ -1327,20 +1219,60 @@ mod tests {
   fn skips_a_core_with_fewer_states_than_its_table() {
     // a middle tier in its own complex with 16 states, against the 20 of the P-complex table
     let soc = m6_soc();
-    let mut cores = CpuTierCores::new(&soc);
+    let mut topology = CpuTopology::default();
+    let mut cores = CpuTierCores::new(&soc, &mut topology);
     assert!(cores.add("MACC_MCPU0", &residencies(16, 50, &[(15, 50)])));
     assert!(cores.into_metrics()[1].cores.is_empty());
   }
 
   #[test]
   fn orders_named_core_metrics() {
-    let cores = collect_cpu_core_metrics(HashMap::from([
-      ("DIE_1_ECPU0".into(), (2000, 0.50, 0.75)),
-      ("DIE_0_ECPU1".into(), (1000, 0.25, 0.50)),
-    ]));
+    let cores = collect_cpu_core_metrics(
+      HashMap::from([
+        ("DIE_1_ECPU0".into(), (2000, 0.50, 0.75)),
+        ("DIE_0_ECPU1".into(), (1000, 0.25, 0.50)),
+      ]),
+      &mut Vec::new(),
+    );
 
     assert_eq!((cores[0].die_id, cores[0].core_id), (0, 1));
     assert_eq!((cores[1].die_id, cores[1].core_id), (1, 0));
+  }
+
+  #[test]
+  fn cached_topology_handles_reordered_missing_and_returning_cores() {
+    let soc = m6_soc();
+    let mut topology = CpuTopology::default();
+    let first = "DIE_0_PCPU_CPU0";
+    let second = "DIE_0_PCPU1_CPU0";
+    let other_die = "DIE_1_PCPU_CPU0";
+    for channels in [
+      vec![first, second, other_die],
+      vec![other_die, second, first],
+      vec![second, other_die],
+      vec![],
+      vec![other_die, first, second],
+    ] {
+      let mut cores = CpuTierCores::new(&soc, &mut topology);
+      for channel in &channels {
+        let idle = if *channel == first { 100 } else { 50 };
+        assert!(cores.add(channel, &residencies(20, idle, &[(19, 50)])));
+      }
+      let tiers = cores.into_metrics();
+      assert!(tiers[0].cores.is_empty() && tiers[1].cores.is_empty());
+      let result = &tiers[2].cores;
+      let ids = result.iter().map(|core| (core.die_id, core.core_id)).collect::<Vec<_>>();
+      match channels.len() {
+        0 => assert!(ids.is_empty()),
+        2 => assert_eq!(ids, [(0, 0), (1, 0)]),
+        3 => {
+          assert_eq!(ids, [(0, 0), (0, 1), (1, 0)]);
+          assert!((result[0].active_ratio - 1.0 / 3.0).abs() < 1e-6);
+          assert_eq!(result[1].active_ratio, 0.5);
+        }
+        _ => unreachable!(),
+      }
+    }
   }
 
   #[test]
@@ -1358,6 +1290,15 @@ mod tests {
     assert_eq!(frequency, 1800);
     assert!((scaled_ratio - 0.45).abs() < f32::EPSILON);
     assert!((active_ratio - 0.5).abs() < f32::EPSILON);
+    for idle in [0, 500] {
+      assert_eq!(
+        calc_freq_from_residencies(
+          &[("IDLE".into(), idle), ("1000 MHz".into(), 0), ("2000 MHz".into(), 0)],
+          &[1000, 2000],
+        ),
+        (0, 0.0, 0.0),
+      );
+    }
   }
 
   #[test]
@@ -1429,12 +1370,15 @@ mod tests {
 
   #[test]
   fn flattens_real_ultra_cluster_channels_into_core_ids() {
-    let cores = collect_cpu_core_metrics(HashMap::from([
-      ("DIE_0_PCPU1_CPU0".into(), (2000, 0.50, 0.75)),
-      ("DIE_0_PCPU_CPU1".into(), (1100, 0.25, 0.50)),
-      ("DIE_0_PCPU_CPU0".into(), (1000, 0.20, 0.40)),
-      ("DIE_1_PCPU_CPU0".into(), (1200, 0.30, 0.60)),
-    ]));
+    let cores = collect_cpu_core_metrics(
+      HashMap::from([
+        ("DIE_0_PCPU1_CPU0".into(), (2000, 0.50, 0.75)),
+        ("DIE_0_PCPU_CPU1".into(), (1100, 0.25, 0.50)),
+        ("DIE_0_PCPU_CPU0".into(), (1000, 0.20, 0.40)),
+        ("DIE_1_PCPU_CPU0".into(), (1200, 0.30, 0.60)),
+      ]),
+      &mut Vec::new(),
+    );
 
     assert_eq!(
       cores.iter().map(|core| (core.die_id, core.core_id, core.freq_mhz)).collect::<Vec<_>>(),
